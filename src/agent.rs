@@ -97,6 +97,10 @@ fn header(b: &Browser) -> String {
 fn normalize(url: &str) -> String {
     if url.contains("://") || url.starts_with("about:") || url.starts_with("data:") {
         url.to_string()
+    } else if ["localhost", "127.0.0.1", "[::1]"].iter().any(|h| {
+        url.strip_prefix(h).is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+    }) {
+        format!("http://{url}") // local dev servers rarely have TLS
     } else {
         format!("https://{url}")
     }
