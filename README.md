@@ -60,13 +60,22 @@ After an action you get only what changed, which keeps agent context small:
 - - textbox "Email" [ref=e2]
 ```
 
+## Install
+
+One file, about 0.5 MB, for Windows 10 and 11 (x64). Download it from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) or in PowerShell:
+
+```powershell
+mkdir "$env:LOCALAPPDATA\quietbrowser\bin" -Force
+curl.exe -L -o "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" https://github.com/emrehangorgec/quietbrowser/releases/latest/download/quietbrowser.exe
+```
+
 ## Use it from your agent
 
-```
-quietbrowser install-skill
+```powershell
+& "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" install-skill
 ```
 
-This installs a skill in `~/.claude/skills/quietbrowser` that tells Claude Code when and how to use the browser. Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
+This installs a skill in `~/.claude/skills/quietbrowser` that tells Claude Code when and how to use the browser, with the path to the exe. Then ask your agent to open a page. Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
 
 ## How it works
 
@@ -88,7 +97,7 @@ The result is a single `quietbrowser.exe` with no other files to ship. The focus
 
 ## Status
 
-Early. There are no prebuilt releases yet. Not done yet: several agents in separate workspaces, a DevTools endpoint for Playwright, and packages for winget and Scoop.
+Early. The exe is not code signed yet, so a browser download may show a SmartScreen warning once. Not done yet: several agents in separate workspaces, a DevTools endpoint for Playwright, and packages for winget and Scoop.
 
 Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile`. If a site needs a login or a CAPTCHA, the skill tells the agent to ask you to do it in the window.
 
