@@ -5,7 +5,7 @@ description: "Browse web pages without stealing the user's keyboard focus. Use w
 
 # quietbrowser
 
-`quietbrowser` drives a real browser window (WebView2 on Windows, your installed Chrome on macOS and Linux) that never takes focus.
+`quietbrowser` drives a real browser that never takes focus: a WebView2 window on Windows, and your installed Chrome without a window on macOS and Linux.
 The user can keep typing while you work. Each command prints its result as plain text.
 
 ## Commands
@@ -44,6 +44,7 @@ quietbrowser quit                    close the window when you are done
 * Dialogs are accepted automatically. Check `dialogs` if a page seems stuck.
 * Downloads are blocked and popups open in the same window.
 * If a page needs a login or a CAPTCHA, stop and ask the user to click the
-  quietbrowser window and do it themselves. Never type passwords, card numbers or
+  quietbrowser window and do it themselves (on macOS and Linux they first run
+  `quietbrowser quit`, then start it with `QUIETBROWSER_HEADED=1` to get a window). Never type passwords, card numbers or
   other secrets. The profile is kept, so the login stays for later runs.
 * Do not try to bring the window to the front. Leaving focus with the user is the point.

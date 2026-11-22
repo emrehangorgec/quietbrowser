@@ -215,8 +215,10 @@ fn serve_chrome(port: u16) -> Result<(), String> {
     loop {
         let Some(job) = server::wait_job(Duration::from_secs(3600)) else { continue };
         if job.cmd == server::QUIT {
-            let _ = job.reply.send(Ok("bye".into()));
+            // close first, so the next command never reaches this server while it shuts down
             c.close();
+            let _ = job.reply.send(Ok("bye".into()));
+            std::thread::sleep(Duration::from_millis(200));
             return Ok(());
         }
         let _ = job.reply.send(agent::run(&c, &job.cmd, &job.args));
@@ -348,7 +350,7 @@ fn ensure_running() -> Result<(), String> {
 pub fn call(cmd: &str, args: &[String]) -> Result<String, String> {
     if cmd == "quit" {
         if running() {
-            let _ = request("GET", "/quit", "", Duration::from_secs(5));
+            let _ = request("GET", "/quit", "", Duration::from_secs(20));
         }
         return Ok("closed".into());
     }

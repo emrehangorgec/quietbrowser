@@ -1,16 +1,18 @@
 # quietbrowser
 
-**A browser for coding agents on Windows that never steals your focus.**
+**A browser for coding agents that never steals your focus.**
 
 <p align="center">
   <img src="docs/demo.gif" alt="Screen recording: text is typed into a focused editor while an agent opens a sign up page in quietbrowser behind it, fills the email, ticks the box and submits. The focus line stays on the editor with 0 focus steals." width="900">
 </p>
 
-When Claude Code, Codex or another agent opens a browser, the window jumps in front of you and your next keystrokes land in the wrong place. quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agent drives it from the command line while you keep typing. Click the window when you want to use it yourself.
+When Claude Code, Codex or another agent opens a browser, the window jumps in front of you and your next keystrokes land in the wrong place. On Windows, quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agent drives it from the command line while you keep typing. Click the window when you want to use it yourself.
+
+On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Set `QUIETBROWSER_HEADED=1` to see the window, for example to log in once; Chrome then comes to the front when it starts.
 
 ## Measured
 
-A test window stays in front while the browser is started and driven in the background. It records every moment another window becomes the foreground window and counts typed keys that never arrive. The test pages try hard to grab focus: `autofocus`, `window.focus()` every 50 ms, `alert`/`confirm`/`prompt`, `window.open`.
+On Windows. A test window stays in front while the browser is started and driven in the background. It records every moment another window becomes the foreground window and counts typed keys that never arrive. The test pages try hard to grab focus: `autofocus`, `window.focus()` every 50 ms, `alert`/`confirm`/`prompt`, `window.open`.
 
 | Run | Commands | Focus taken | Keys lost |
 |---|---|---|---|
@@ -74,6 +76,8 @@ codex mcp add quietbrowser -- npx -y quietbrowser mcp
 
 The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
 
+The npm package and the release downloads are Windows only for now. On macOS and Linux, build from source (see Build).
+
 Without Node.js, download the exe (one file, about 0.5 MB, Windows 10 and 11 x64) from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) or in PowerShell, and add that path instead of `npx -y quietbrowser`:
 
 ```powershell
@@ -97,6 +101,7 @@ Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
 * The window is shown with `WS_EX_NOACTIVATE` and never calls `SetForegroundWindow`. A click by you activates it like a normal window, and it goes quiet again when you switch away.
 * `alert`, `confirm` and `prompt` are answered in code, popups open in the same window and downloads are blocked, so no dialog appears.
 * Snapshots come from the Chrome DevTools Protocol accessibility tree. Clicks and typing are sent as input events, so pages see a real user gesture.
+* On macOS and Linux, Chrome is started with its own profile and driven over the same protocol through a WebSocket. Without `QUIETBROWSER_HEADED=1` it runs headless.
 * One small executable (about 0.5 MB, written in Rust). `quietbrowser serve` runs the window; every other command is a client that starts it when needed and talks to it over a local HTTP port (`QUIETBROWSER_PORT`, default 9555).
 
 ## Build
@@ -110,11 +115,20 @@ target\release\quietbrowser.exe open example.com
 
 The result is a single `quietbrowser.exe` with no other files to ship. The focus test in `test/FocusTest` needs the .NET SDK.
 
+On macOS and Linux, install Rust and one Chromium based browser, then:
+
+```
+cargo build --release
+target/release/quietbrowser open example.com
+```
+
+If the browser is not found, point `QUIETBROWSER_CHROME` at it. `python test/smoke.py target/release/quietbrowser` runs the end to end test on any system; CI runs it on Windows, macOS and Linux.
+
 ## Status
 
 Early. The exe is not code signed yet, so a browser download may show a SmartScreen warning once. Not done yet: several agents in separate workspaces, a DevTools endpoint for Playwright, and packages for winget and Scoop.
 
-Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile`. If a site needs a login or a CAPTCHA, the skill tells the agent to ask you to do it in the window.
+Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile` on Windows, `~/Library/Application Support/quietbrowser` on macOS and `~/.local/share/quietbrowser` on Linux. If a site needs a login or a CAPTCHA, the skill tells the agent to ask you to do it in the window. On macOS and Linux, run once with `QUIETBROWSER_HEADED=1` to get a window for that.
 
 ## License
 

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 const VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
-const INSTRUCTIONS: &str = "quietbrowser is a real browser window (WebView2 on Windows, Chrome elsewhere) that never takes \
+const INSTRUCTIONS: &str = "quietbrowser is a real browser (a WebView2 window on Windows, headless Chrome elsewhere) that never takes \
 keyboard focus, so the user can keep typing while you browse. Start with browser_navigate, then act with the \
 refs from the latest snapshot. Actions return only the lines that changed, or a new snapshot after a \
 navigation. Dialogs are accepted automatically, popups open in the same window and downloads are blocked. \

@@ -111,9 +111,17 @@ fn read_active_port(profile: &Path) -> Option<(u16, String)> {
     Some((port, lines.next().unwrap_or("").trim().to_string()))
 }
 
+/// Chrome raises its own window when it creates one, so by default it runs without a window and
+/// can never take focus. QUIETBROWSER_HEADED=1 shows the window (to watch, or to log in by hand),
+/// at the cost of that guarantee.
+pub fn headed() -> bool {
+    std::env::var("QUIETBROWSER_HEADED").is_ok_and(|v| v == "1")
+}
+
 fn launch(profile: &Path) -> R<()> {
     let browser = find_browser()?;
-    log(&format!("starting {}", browser.display()));
+    let headed = headed();
+    log(&format!("starting {} ({})", browser.display(), if headed { "headed" } else { "headless" }));
     let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
     let mut flags = vec![
         format!("--user-data-dir={}", profile.display()),
@@ -131,10 +139,17 @@ fn launch(profile: &Path) -> R<()> {
         flags.push("--use-mock-keychain".into());
         flags.push("--password-store=basic".into());
     }
+    if !headed {
+        flags.push("--headless=new".into());
+    }
     flags.push("about:blank".into());
 
     let mut exe = browser.clone();
-    if cfg!(target_os = "macos") && browser.extension().is_some_and(|e| e == "app") {
+    let is_bundle = browser.extension().is_some_and(|e| e == "app");
+    if is_bundle && !headed {
+        let name = browser.file_stem().unwrap_or_default().to_os_string();
+        exe = browser.join("Contents").join("MacOS").join(name);
+    } else if cfg!(target_os = "macos") && is_bundle {
         // -g: launch in the background, -n: a separate instance even if the user's browser runs
         // `open` normally returns at once. When macOS holds the launch (a first run prompt, for
         // example) it blocks and the app stays suspended, so give up on it after a while.
@@ -300,8 +315,14 @@ impl Chrome {
 fn close_browser(port: u16, path: &str) {
     if let Ok((_r, mut w)) = ws::connect(&format!("ws://127.0.0.1:{port}{path}")) {
         let _ = w.send_text(&json!({ "id": 1, "method": "Browser.close" }).to_string());
-        std::thread::sleep(Duration::from_millis(300));
     }
+    // Wait until the browser is gone, so a browser started right after does not find the profile
+    // still in use.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) && http_get(port, "/json/version").is_ok() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
 }
 
 impl Engine for Chrome {
