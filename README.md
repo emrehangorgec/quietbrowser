@@ -76,14 +76,23 @@ codex mcp add quietbrowser -- npx -y quietbrowser mcp
 
 The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
 
-The npm package and the release downloads are Windows only for now. On macOS and Linux, build from source (see Build).
+The package runs on Windows (x64), macOS (Intel and Apple Silicon) and Linux (x64). On macOS and Linux it needs Chrome, Edge, Brave or Chromium installed.
 
-Without Node.js, download the exe (one file, about 0.5 MB, Windows 10 and 11 x64) from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) or in PowerShell, and add that path instead of `npx -y quietbrowser`:
+Without Node.js, download the single binary from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) and add its path instead of `npx -y quietbrowser`. On Windows, in PowerShell:
 
 ```powershell
 mkdir "$env:LOCALAPPDATA\quietbrowser\bin" -Force
 curl.exe -L -o "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" https://github.com/emrehangorgec/quietbrowser/releases/latest/download/quietbrowser.exe
 claude mcp add quietbrowser -- "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" mcp
+```
+
+On macOS (use `quietbrowser-linux-x64` on Linux):
+
+```sh
+mkdir -p ~/.local/bin
+curl -L -o ~/.local/bin/quietbrowser https://github.com/emrehangorgec/quietbrowser/releases/latest/download/quietbrowser-macos
+chmod +x ~/.local/bin/quietbrowser
+claude mcp add quietbrowser -- ~/.local/bin/quietbrowser mcp
 ```
 
 ## Command line and skill

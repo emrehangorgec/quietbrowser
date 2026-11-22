@@ -1,15 +1,28 @@
 #!/usr/bin/env node
-// Runs the bundled quietbrowser.exe with the same arguments, stdio and exit code.
+// Runs the bundled quietbrowser binary for this system with the same arguments, stdio and exit code.
 "use strict";
 const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
 const path = require("node:path");
 
-if (process.platform !== "win32") {
-  console.error("quietbrowser runs on Windows only (it uses Microsoft Edge WebView2).");
+const binaries = {
+  win32: "quietbrowser.exe", // x64, also runs on Windows on Arm
+  darwin: "quietbrowser-macos", // Intel and Apple Silicon
+  linux: process.arch === "x64" ? "quietbrowser-linux-x64" : null,
+};
+const name = binaries[process.platform];
+if (!name) {
+  console.error(`quietbrowser has no prebuilt binary for ${process.platform} ${process.arch}. Build it from source: https://github.com/emrehangorgec/quietbrowser`);
   process.exit(1);
 }
 
-const exe = path.join(__dirname, "..", "quietbrowser.exe");
+const exe = path.join(__dirname, "..", name);
+if (process.platform !== "win32") {
+  // a package packed on Windows loses the executable bit
+  try {
+    fs.chmodSync(exe, 0o755);
+  } catch {}
+}
 const env = { ...process.env };
 // Tells `install-skill` how the agent should run quietbrowser later.
 if (!env.QUIETBROWSER_LAUNCHER) {

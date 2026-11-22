@@ -5,6 +5,8 @@
 results/
 target/
 npm/quietbrowser.exe
+npm/quietbrowser-macos
+npm/quietbrowser-linux-x64
 npm/LICENSE
 *.tgz
 test/FocusTest/bin/
