@@ -3,7 +3,7 @@
 **A browser for coding agents on Windows that never steals your focus.**
 
 <p align="center">
-  <img src="docs/hero.svg" alt="You keep typing in your editor while the agent opens a sign-up page, fills the email, ticks the box and submits it in a quietbrowser window behind it" width="860">
+  <img src="docs/demo.gif" alt="Screen recording: text is typed into a focused editor while an agent opens a sign up page in quietbrowser behind it, fills the email, ticks the box and submits. The focus line stays on the editor with 0 focus steals." width="900">
 </p>
 
 When Claude Code, Codex or another agent opens a browser, the window jumps in front of you and your next keystrokes land in the wrong place. quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agent drives it from the command line while you keep typing. Click the window when you want to use it yourself.
