@@ -327,7 +327,7 @@ fn ensure_running() -> Result<(), String> {
     let mut exited = spawn_server()?;
     // Timed by the clock: on Windows a refused connection to localhost takes about 2 s.
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(45) {
+    while start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(Duration::from_millis(100));
         if running() {
             return Ok(());
@@ -341,7 +341,7 @@ fn ensure_running() -> Result<(), String> {
             return Err(format!("the browser could not start: {reason}"));
         }
     }
-    Err("the browser did not start within 45 s".into())
+    Err("the browser did not start within 60 s".into())
 }
 
 /// Runs one command in the browser window, starting it if needed. Used by the CLI and the MCP server.

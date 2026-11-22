@@ -136,7 +136,9 @@ fn launch(profile: &Path) -> R<()> {
     let mut exe = browser.clone();
     if cfg!(target_os = "macos") && browser.extension().is_some_and(|e| e == "app") {
         // -g: launch in the background, -n: a separate instance even if the user's browser runs
-        let out = std::process::Command::new("open")
+        // `open` normally returns at once. When macOS holds the launch (a first run prompt, for
+        // example) it blocks and the app stays suspended, so give up on it after a while.
+        let child = std::process::Command::new("open")
             .arg("-g")
             .arg("-n")
             .arg("-a")
@@ -144,10 +146,31 @@ fn launch(profile: &Path) -> R<()> {
             .arg("--args")
             .args(&flags)
             .stdin(std::process::Stdio::null())
-            .output();
-        match out {
-            Ok(o) if o.status.success() => return Ok(()),
-            Ok(o) => log(&format!("open failed ({}): {}", o.status, String::from_utf8_lossy(&o.stderr).trim())),
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                let start = Instant::now();
+                loop {
+                    match c.try_wait() {
+                        Ok(Some(status)) if status.success() => return Ok(()),
+                        Ok(Some(status)) => {
+                            log(&format!("open failed: {status}"));
+                            break;
+                        }
+                        Ok(None) if start.elapsed() < Duration::from_secs(10) => {
+                            std::thread::sleep(Duration::from_millis(100))
+                        }
+                        _ => {
+                            log("open did not return, starting the browser binary directly");
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            break;
+                        }
+                    }
+                }
+            }
             Err(e) => log(&format!("open failed: {e}")),
         }
         // fall back to the binary inside the bundle
