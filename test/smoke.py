@@ -1,26 +1,26 @@
-"""End to end smoke test: drives the quietbrowser CLI against a local page.
+"""End to end smoke test: drives the quietbrowser CLI against local files.
 
 Usage: python test/smoke.py path/to/quietbrowser [--engine chrome|webview2]
 Uses port 9577 so it does not touch a browser you already have open.
 On macOS it also checks after every command that the browser never became the front app.
 """
 
-import http.server
 import os
+import pathlib
 import subprocess
 import sys
-import threading
+import tempfile
 
-PAGE = b"""<!doctype html><title>Smoke home</title>
+PAGE = """<!doctype html><title>Smoke home</title>
 <h1>Smoke test</h1>
 <input id="name" aria-label="Name">
 <button id="go" onclick="document.getElementById('out').textContent='Hello '+document.getElementById('name').value">Greet</button>
 <p id="out">waiting</p>
 <select id="color" aria-label="Color"><option>red</option><option>green</option></select>
 <button onclick="alert('hi there')">Alert</button>
-<a href="/two">Second page</a>
+<a href="two.html">Second page</a>
 """
-TWO = b"<!doctype html><title>Smoke two</title><h1>Second page</h1><p>arrived</p>"
+TWO = "<!doctype html><title>Smoke two</title><h1>Second page</h1><p>arrived</p>"
 
 
 def front_app():
@@ -35,28 +35,17 @@ def front_app():
 BROWSER_NAMES = ("chrome", "chromium", "edge", "brave")
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = TWO if self.path == "/two" else PAGE
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-
 def main():
     exe = os.path.abspath(sys.argv[1])
     env = dict(os.environ, QUIETBROWSER_PORT="9577")
     if "--engine" in sys.argv:
         env["QUIETBROWSER_ENGINE"] = sys.argv[sys.argv.index("--engine") + 1]
 
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    # plain files, so the test runs no server of its own
+    site = pathlib.Path(tempfile.mkdtemp(prefix="quietbrowser-smoke-"))
+    (site / "index.html").write_text(PAGE, encoding="utf-8")
+    (site / "two.html").write_text(TWO, encoding="utf-8")
+    base = (site / "index.html").as_uri()
 
     failures = 0
 
@@ -94,7 +83,6 @@ def main():
         run("screenshot", expect=None)
     finally:
         run("quit")
-        httpd.shutdown()
 
     print("passed" if failures == 0 else f"{failures} failed")
     sys.exit(1 if failures else 0)

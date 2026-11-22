@@ -28,23 +28,31 @@ jobs:
       - name: Smoke test (Chrome)
         if: runner.os == 'Windows'
         run: python test/smoke.py target/release/quietbrowser.exe --engine chrome
-      - name: Inspect the macOS desktop
+      # A fresh runner has never launched Chrome, so Gatekeeper verifies it on the first launch and
+      # `open` blocks until that ends. On a normal Mac this happened long ago. Get it done here.
+      - name: Let Gatekeeper verify Chrome once
         if: runner.os == 'macOS'
         run: |
           mkdir -p shots
-          screencapture -x shots/1-start.png || true
-          lsappinfo info -only name -only bundleid -only pid "$(lsappinfo front)" || true
-          ps aux | grep -i -E 'UserNotificationCenter|CoreServicesUIAgent|SecurityAgent' | grep -v grep || true
-          perl -e 'alarm 20; exec @ARGV' open -a TextEdit && echo "open returned" || echo "open TextEdit timed out or failed"
+          sudo xattr -dr com.apple.quarantine "/Applications/Google Chrome.app" || true
+          perl -e 'alarm 180; exec @ARGV' open -g -a "Google Chrome" --args --headless=new --user-data-dir="$RUNNER_TEMP/warmup" about:blank \
+            && echo "open returned" || echo "open did not return"
+          sleep 5
+          pkill -x "Google Chrome" || true
+          sleep 2
+          open -a TextEdit
           sleep 3
-          screencapture -x shots/2-after-textedit.png || true
-          lsappinfo info -only name -only bundleid "$(lsappinfo front)" || true
+          screencapture -x shots/1-before-test.png || true
+          lsappinfo info -only name "$(lsappinfo front)" || true
       - name: Smoke test with focus check (Chrome)
         if: runner.os == 'macOS'
-        run: python test/smoke.py target/release/quietbrowser
+        run: |
+          python test/smoke.py target/release/quietbrowser
+          # the test must have used the background launch, not the fallback
+          ! grep -q "starting the browser binary directly" "$HOME/Library/Application Support/quietbrowser/log.txt"
       - name: Screenshot after the test
         if: always() && runner.os == 'macOS'
-        run: screencapture -x shots/3-end.png || true
+        run: screencapture -x shots/2-end.png || true
       - name: Upload screenshots
         if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v4
