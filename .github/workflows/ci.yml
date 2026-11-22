@@ -28,12 +28,29 @@ jobs:
       - name: Smoke test (Chrome)
         if: runner.os == 'Windows'
         run: python test/smoke.py target/release/quietbrowser.exe --engine chrome
-      - name: Smoke test with focus check (Chrome)
+      - name: Inspect the macOS desktop
         if: runner.os == 'macOS'
         run: |
-          open -a TextEdit
+          mkdir -p shots
+          screencapture -x shots/1-start.png || true
+          lsappinfo info -only name -only bundleid -only pid "$(lsappinfo front)" || true
+          ps aux | grep -i -E 'UserNotificationCenter|CoreServicesUIAgent|SecurityAgent' | grep -v grep || true
+          perl -e 'alarm 20; exec @ARGV' open -a TextEdit && echo "open returned" || echo "open TextEdit timed out or failed"
           sleep 3
-          python test/smoke.py target/release/quietbrowser
+          screencapture -x shots/2-after-textedit.png || true
+          lsappinfo info -only name -only bundleid "$(lsappinfo front)" || true
+      - name: Smoke test with focus check (Chrome)
+        if: runner.os == 'macOS'
+        run: python test/smoke.py target/release/quietbrowser
+      - name: Screenshot after the test
+        if: always() && runner.os == 'macOS'
+        run: screencapture -x shots/3-end.png || true
+      - name: Upload screenshots
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-screens
+          path: shots/
       - name: Smoke test (Chrome under Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a python test/smoke.py target/release/quietbrowser
