@@ -133,23 +133,36 @@ fn launch(profile: &Path) -> R<()> {
     }
     flags.push("about:blank".into());
 
-    let mut cmd = if cfg!(target_os = "macos") && browser.extension().is_some_and(|e| e == "app") {
+    let mut exe = browser.clone();
+    if cfg!(target_os = "macos") && browser.extension().is_some_and(|e| e == "app") {
         // -g: launch in the background, -n: a separate instance even if the user's browser runs
-        let mut c = std::process::Command::new("open");
-        c.arg("-g").arg("-n").arg("-a").arg(&browser).arg("--args").args(&flags);
-        c
-    } else {
-        let mut c = std::process::Command::new(&browser);
-        c.args(&flags);
-        c
-    };
+        let out = std::process::Command::new("open")
+            .arg("-g")
+            .arg("-n")
+            .arg("-a")
+            .arg(&browser)
+            .arg("--args")
+            .args(&flags)
+            .stdin(std::process::Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => return Ok(()),
+            Ok(o) => log(&format!("open failed ({}): {}", o.status, String::from_utf8_lossy(&o.stderr).trim())),
+            Err(e) => log(&format!("open failed: {e}")),
+        }
+        // fall back to the binary inside the bundle
+        let name = browser.file_stem().unwrap_or_default().to_os_string();
+        exe = browser.join("Contents").join("MacOS").join(name);
+    }
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&flags);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    cmd.spawn().map_err(|e| format!("could not start {}: {e}", browser.display()))?;
+    cmd.spawn().map_err(|e| format!("could not start {}: {e}", exe.display()))?;
     Ok(())
 }
 

@@ -43,6 +43,8 @@ jobs:
           for f in "$LOCALAPPDATA/quietbrowser/log.txt" "$HOME/Library/Application Support/quietbrowser/log.txt" "$HOME/.local/share/quietbrowser/log.txt"; do
             [ -f "$f" ] && tail -n 80 "$f"
           done
+          ps aux | grep -i -E 'chrom|open ' | grep -v grep | head -20
+          ls -la "$HOME/Library/Application Support/quietbrowser/chrome-profile" 2>/dev/null | head -20
           true
     env:
       QUIETBROWSER_LOG: "1"
