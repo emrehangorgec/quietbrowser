@@ -137,6 +137,16 @@ pub fn run(b: &Browser, cmd: &str, args: &[String]) -> R<String> {
             let key = arg(0, "key")?;
             after(b, || press(b, &key))
         }
+        "hover" => {
+            let t = arg(0, "ref")?;
+            after(b, || hover(b, &t))
+        }
+        "select" => {
+            let t = arg(0, "ref")?;
+            arg(1, "value")?;
+            let values = args[1..].to_vec();
+            after(b, || select(b, &t, &values))
+        }
         "text" => {
             let json = script(b, "document.body ? document.body.innerText : ''")?;
             let mut text: String = serde_json::from_str(&json).unwrap_or_default();
@@ -242,20 +252,54 @@ fn call_on(b: &Browser, object_id: &str, function: &str) -> R<()> {
 /// (script clicks are skipped by the back button and blocked by some sites).
 fn click(b: &Browser, target: &str) -> R<()> {
     let id = resolve(b, target)?;
-    call_on(b, &id, "function(){this.scrollIntoView({block:'center',inline:'center'})}")?;
-    let quads = cdp(b, "DOM.getContentQuads", json!({ "objectId": id }))?;
-    let Some(q) = quads["quads"].as_array().and_then(|a| a.first()).and_then(|q| q.as_array()) else {
+    let Some((x, y)) = center(b, &id)? else {
         return call_on(b, &id, "function(){this.click()}"); // not rendered as a box, fall back
     };
-    let q: Vec<f64> = q.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
-    if q.len() < 8 {
-        return call_on(b, &id, "function(){this.click()}");
-    }
-    let x = (q[0] + q[2] + q[4] + q[6]) / 4.0;
-    let y = (q[1] + q[3] + q[5] + q[7]) / 4.0;
     cdp(b, "Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))?;
     for t in ["mousePressed", "mouseReleased"] {
         cdp(b, "Input.dispatchMouseEvent", json!({ "type": t, "x": x, "y": y, "button": "left", "clickCount": 1 }))?;
+    }
+    Ok(())
+}
+
+/// Scrolls the element into view and returns its center in page coordinates, if it has a box.
+fn center(b: &Browser, id: &str) -> R<Option<(f64, f64)>> {
+    call_on(b, id, "function(){this.scrollIntoView({block:'center',inline:'center'})}")?;
+    let quads = cdp(b, "DOM.getContentQuads", json!({ "objectId": id }))?;
+    let Some(q) = quads["quads"].as_array().and_then(|a| a.first()).and_then(|q| q.as_array()) else {
+        return Ok(None);
+    };
+    let q: Vec<f64> = q.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+    if q.len() < 8 {
+        return Ok(None);
+    }
+    Ok(Some(((q[0] + q[2] + q[4] + q[6]) / 4.0, (q[1] + q[3] + q[5] + q[7]) / 4.0)))
+}
+
+fn hover(b: &Browser, target: &str) -> R<()> {
+    let id = resolve(b, target)?;
+    let (x, y) = center(b, &id)?.ok_or_else(|| format!("{target} has no box to hover"))?;
+    cdp(b, "Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y })).map(|_| ())
+}
+
+/// Selects options of a <select> by value or label and fires input and change events.
+fn select(b: &Browser, target: &str, values: &[String]) -> R<()> {
+    let id = resolve(b, target)?;
+    let res = cdp(
+        b,
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": id,
+            "functionDeclaration": "function(values){if(!this.options)throw new Error('not a select element');\
+                let n=0;for(const o of this.options){o.selected=values.includes(o.value)||values.includes(o.label.trim());if(o.selected)n++;}\
+                if(!n)throw new Error('no option matches '+values.join(', '));\
+                this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}",
+            "arguments": [{ "value": values }],
+        }),
+    )?;
+    if let Some(ex) = res.get("exceptionDetails") {
+        let msg = ex["exception"]["description"].as_str().or(ex["text"].as_str()).unwrap_or("");
+        return Err(format!("page error: {}", msg.lines().next().unwrap_or("")));
     }
     Ok(())
 }

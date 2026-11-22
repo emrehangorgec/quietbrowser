@@ -17,6 +17,8 @@ quietbrowser click <ref|selector>    click, prints what changed
 quietbrowser fill <ref|selector> <text>
 quietbrowser type <text>             type into the focused element
 quietbrowser press <key>             Enter, Tab, Escape, Backspace, ArrowDown, a ...
+quietbrowser hover <ref|selector>    move the mouse over an element
+quietbrowser select <ref|selector> <value>...   choose options in a dropdown
 quietbrowser text                    visible text of the page
 quietbrowser eval <js>               run JavaScript, prints the JSON result
 quietbrowser back | reload

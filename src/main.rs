@@ -3,6 +3,7 @@
 // client that sends one command to it and prints the answer, starting the window first if needed.
 mod agent;
 mod browser;
+mod mcp;
 mod server;
 
 use std::io::{Read, Write};
@@ -21,6 +22,9 @@ Usage: quietbrowser <command> [args]
                          Set an input's value, print what changed
   type <text>            Type into the focused element
   press <key>            Press a key (Enter, Tab, Escape, ArrowDown, a, ...)
+  hover <ref|selector>   Move the mouse over an element
+  select <ref|selector> <value>...
+                         Choose options in a <select> by value or label
   text                   Print the page's visible text
   eval <js>              Run JavaScript, print the JSON result
   back | reload          Navigate back or reload
@@ -29,6 +33,7 @@ Usage: quietbrowser <command> [args]
   media dark|light|reset Emulate the page's color scheme
   start | quit           Start or close the browser window
   install-skill          Install the agent skill for Claude Code (~/.claude/skills/quietbrowser)
+  mcp                    Run as an MCP server over stdio (Playwright MCP tool names)
 
 The window shows up without taking focus. Click it to use it yourself.
 Port: QUIETBROWSER_PORT (default 9555).";
@@ -75,6 +80,19 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn port() -> u16 {
     std::env::var("QUIETBROWSER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9555)
 }
@@ -87,6 +105,7 @@ fn main() {
             0
         }
         Some("serve") => serve(&args[1..]),
+        Some("mcp") => mcp::serve(),
         Some(cmd) => match client(cmd, &args[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -202,32 +221,41 @@ fn ensure_running() -> Result<(), String> {
     Err("the browser did not start within 30 s".into())
 }
 
-fn client(cmd: &str, args: &[String]) -> Result<i32, String> {
-    match cmd {
-        "install-skill" => return install_skill().map(|_| 0),
-        "quit" => {
-            if running() {
-                let _ = request("GET", "/quit", "", Duration::from_secs(5));
-            }
-            println!("closed");
-            return Ok(0);
+/// Runs one command in the browser window, starting it if needed. Used by the CLI and the MCP server.
+pub fn call(cmd: &str, args: &[String]) -> Result<String, String> {
+    if cmd == "quit" {
+        if running() {
+            let _ = request("GET", "/quit", "", Duration::from_secs(5));
         }
-        _ => {}
+        return Ok("closed".into());
     }
     ensure_running()?;
     if cmd == "start" {
-        println!("running");
-        return Ok(0);
+        return Ok("running".into());
     }
     let body = serde_json::json!({ "cmd": cmd, "args": args }).to_string();
     let (code, text) = request("POST", "/run", &body, Duration::from_secs(120)).map_err(|e| e.to_string())?;
     if code != 200 {
-        eprintln!("error: {text}");
-        return Ok(1);
+        return Err(text);
     }
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{text}");
-    Ok(0)
+    Ok(text)
+}
+
+fn client(cmd: &str, args: &[String]) -> Result<i32, String> {
+    if cmd == "install-skill" {
+        return install_skill().map(|_| 0);
+    }
+    match call(cmd, args) {
+        Ok(text) => {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{text}");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Ok(1)
+        }
+    }
 }
 
 fn install_skill() -> Result<(), String> {

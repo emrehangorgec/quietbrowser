@@ -30,6 +30,8 @@ quietbrowser click <ref|selector>    click with real mouse events, print what ch
 quietbrowser fill <ref|selector> <text>
 quietbrowser type <text>             type into the focused element
 quietbrowser press <key>             Enter, Tab, Escape, Backspace, ArrowDown, a ...
+quietbrowser hover <ref|selector>
+quietbrowser select <ref|selector> <value>...
 quietbrowser text                    visible text of the page
 quietbrowser eval <js>               run JavaScript, print the JSON result
 quietbrowser back | reload
@@ -38,6 +40,7 @@ quietbrowser screenshot [file.png]   save a screenshot, print the path
 quietbrowser media dark|light|reset  emulate the color scheme
 quietbrowser start | quit
 quietbrowser install-skill           install the agent skill for Claude Code
+quietbrowser mcp                     run as an MCP server over stdio
 ```
 
 The first command starts the browser. A snapshot looks like this:
@@ -71,11 +74,20 @@ curl.exe -L -o "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" https://git
 
 ## Use it from your agent
 
+As an MCP server. The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them:
+
+```powershell
+claude mcp add quietbrowser -- "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" mcp
+codex mcp add quietbrowser -- "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" mcp
+```
+
+Or as a command line tool with a skill that tells Claude Code when and how to use it:
+
 ```powershell
 & "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" install-skill
 ```
 
-This installs a skill in `~/.claude/skills/quietbrowser` that tells Claude Code when and how to use the browser, with the path to the exe. Then ask your agent to open a page. Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
+The skill goes to `~/.claude/skills/quietbrowser` and includes the path to the exe. Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
 
 ## How it works
 
