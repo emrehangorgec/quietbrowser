@@ -7,3 +7,5 @@ target/
 npm/quietbrowser.exe
 npm/LICENSE
 *.tgz
+test/FocusTest/bin/
+test/FocusTest/obj/

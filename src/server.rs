@@ -1,13 +1,13 @@
-// Local HTTP API. Each request is handed to the UI thread and answered with plain text.
+// Local HTTP API. Each request is handed to the engine's thread and answered with plain text.
 // One command runs at a time.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use windows::Win32::UI::WindowsAndMessaging::{WM_APP, WM_CLOSE};
+/// The job that closes the browser.
+pub const QUIT: &str = "__quit";
 
 pub struct Job {
     pub cmd: String,
@@ -15,21 +15,31 @@ pub struct Job {
     pub reply: Sender<Result<String, String>>,
 }
 
-static HWND: AtomicIsize = AtomicIsize::new(0);
+static ID: OnceLock<String> = OnceLock::new();
+static WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 static QUEUE: Mutex<Option<Sender<Job>>> = Mutex::new(None);
 
 thread_local! {
     static JOBS: std::cell::RefCell<Option<Receiver<Job>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Called on the UI thread.
+/// Called on the engine's thread (the thread that called `start`).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn next_job() -> Option<Job> {
     JOBS.with(|j| j.borrow().as_ref().and_then(|rx| rx.try_recv().ok()))
 }
 
-/// Binds the port and serves in background threads. Call on the UI thread once the browser is ready.
-pub fn start(port: u16, hwnd: isize) -> std::io::Result<()> {
-    HWND.store(hwnd, Ordering::SeqCst);
+/// Blocks until a job arrives or the timeout passes. Called on the engine's thread.
+pub fn wait_job(timeout: Duration) -> Option<Job> {
+    JOBS.with(|j| j.borrow().as_ref().and_then(|rx| rx.recv_timeout(timeout).ok()))
+}
+
+/// Binds the port and serves in background threads. Call on the engine's thread once the browser
+/// is ready. `id` is reported at /hwnd (the window handle on Windows). `wake` is called after a job
+/// is queued, for engines whose thread is busy with something else, like a message loop.
+pub fn start(port: u16, id: String, wake: Box<dyn Fn() + Send + Sync>) -> std::io::Result<()> {
+    let _ = ID.set(id);
+    let _ = WAKE.set(wake);
     let (tx, rx) = mpsc::channel();
     JOBS.with(|j| *j.borrow_mut() = Some(rx));
     *QUEUE.lock().unwrap() = Some(tx);
@@ -141,7 +151,9 @@ fn run(cmd: &str, args: Vec<String>) -> Result<String, String> {
     let tx = guard.as_ref().ok_or("not ready")?;
     let (reply, rx) = mpsc::channel();
     tx.send(Job { cmd: cmd.to_string(), args, reply }).map_err(|_| "the browser closed".to_string())?;
-    crate::browser::post_to_window(HWND.load(Ordering::SeqCst), WM_APP);
+    if let Some(wake) = WAKE.get() {
+        wake();
+    }
     rx.recv_timeout(Duration::from_secs(300)).map_err(|_| "the browser did not answer".to_string())?
 }
 
@@ -157,17 +169,14 @@ fn dispatch(path: &str, q: &[(String, String)], body: &str) -> Result<String, St
                 .unwrap_or_default();
             run(cmd, args)
         }
-        "/hwnd" => Ok(HWND.load(Ordering::SeqCst).to_string()),
+        "/hwnd" => Ok(ID.get().cloned().unwrap_or_default()),
         // Short query-string forms used by the focus test.
         "/open" => run("open", vec![get("url", "about:blank")]),
         "/eval" => run("eval", vec![get("js", "null")]),
         "/click" => run("click", vec![get("sel", "")]),
         "/fill" => run("fill", vec![get("sel", ""), get("text", "")]),
         "/dialogs" => run("dialogs", vec![]),
-        "/quit" => {
-            crate::browser::post_to_window(HWND.load(Ordering::SeqCst), WM_CLOSE);
-            Ok("bye".into())
-        }
+        "/quit" => run(QUIT, vec![]),
         _ => Err(format!("unknown endpoint {path}")),
     }
 }

@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{take_pwstr, CreateCoreWebView2EnvironmentCompletedHandler, CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler, NavigationCompletedEventHandler, ScriptDialogOpeningEventHandler, NewWindowRequestedEventHandler, DownloadStartingEventHandler};
+use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler, NavigationCompletedEventHandler, ScriptDialogOpeningEventHandler, NewWindowRequestedEventHandler, DownloadStartingEventHandler};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -14,24 +14,60 @@ use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
+use crate::engine::{Engine, Nav, Shared};
 use crate::log;
-
-/// State shared by the event handlers and the commands. Borrowed only briefly, never across a wait.
-#[derive(Default)]
-pub struct Shared {
-    pub navigating: Cell<bool>,
-    pub navigations: Cell<u32>,
-    pub nav_result: Cell<Option<bool>>,
-    pub dialogs: RefCell<Vec<String>>,
-    pub refs: RefCell<crate::agent::Refs>,
-    pub last_snapshot: RefCell<Option<String>>,
-}
 
 pub struct Browser {
     pub hwnd: HWND,
     pub controller: ICoreWebView2Controller,
     pub wv: ICoreWebView2,
     pub s: Rc<Shared>,
+}
+
+impl Engine for Browser {
+    fn shared(&self) -> &Shared {
+        &self.s
+    }
+
+    fn cdp_call(&self, method: &str, params: &serde_json::Value, timeout: Duration) -> std::result::Result<serde_json::Value, String> {
+        let (tx, rx) = mpsc::channel();
+        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, json| {
+            let _ = tx.send(match hr {
+                Ok(()) => Ok(json),
+                Err(e) => Err(if json.is_empty() { e.message().to_string() } else { json }),
+            });
+            Ok(())
+        }));
+        unsafe {
+            self.wv
+                .CallDevToolsProtocolMethod(&HSTRING::from(method), &HSTRING::from(params.to_string()), &handler)
+                .map_err(|e| e.to_string())?;
+        }
+        let Some(result) = wait(&rx, timeout)? else {
+            return Err(format!("the page did not answer {method} within {} s", timeout.as_secs()));
+        };
+        let text = result.map_err(|e| format!("{method} failed: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| e.to_string())
+    }
+
+    fn pump(&self, timeout: Duration, done: &mut dyn FnMut() -> bool) -> std::result::Result<bool, String> {
+        pump(timeout, done)
+    }
+
+    fn go(&self, nav: &Nav) -> std::result::Result<(), String> {
+        unsafe {
+            match nav {
+                Nav::Url(url) => self.wv.Navigate(&HSTRING::from(url.as_str())),
+                Nav::Back => self.wv.GoBack(),
+                Nav::Reload => self.wv.Reload(),
+            }
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn title_url(&self) -> (String, String) {
+        (get_string(|p| unsafe { self.wv.DocumentTitle(p) }), get_string(|p| unsafe { self.wv.Source(p) }))
+    }
 }
 
 thread_local! {
@@ -73,10 +109,6 @@ pub fn pump(timeout: Duration, mut done: impl FnMut() -> bool) -> std::result::R
             MsgWaitForMultipleObjects(None, false, left.max(1), QS_ALLINPUT);
         }
     }
-}
-
-pub fn sleep(ms: u64) -> std::result::Result<(), String> {
-    pump(Duration::from_millis(ms), || false).map(|_| ())
 }
 
 /// Waits for one value from a completion handler.
@@ -162,7 +194,11 @@ fn run_queued() {
     }
     while let Some(job) = crate::server::next_job() {
         let result = match current() {
-            Some(b) => crate::agent::run(&b, &job.cmd, &job.args),
+            Some(b) if job.cmd == crate::server::QUIT => {
+                unsafe { let _ = PostMessageW(Some(b.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); }
+                Ok("bye".into())
+            }
+            Some(b) => crate::agent::run(&*b, &job.cmd, &job.args),
             None => Err("the browser is not ready".into()),
         };
         let _ = job.reply.send(result);
@@ -258,10 +294,7 @@ fn add_handlers(wv: &ICoreWebView2, s: &Rc<Shared>, hwnd: HWND, normal: bool) ->
         let hw = hwnd.0 as isize;
         wv.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(move |_, args| {
-                st.navigating.set(true);
-                st.navigations.set(st.navigations.get() + 1);
-                st.refs.borrow_mut().clear();
-                *st.last_snapshot.borrow_mut() = None;
+                st.nav_started();
                 if let Some(a) = args {
                     let uri = get_string(|p| a.Uri(p));
                     log(&format!("nav starting {}", uri.chars().take(80).collect::<String>()));
@@ -281,8 +314,7 @@ fn add_handlers(wv: &ICoreWebView2, s: &Rc<Shared>, hwnd: HWND, normal: bool) ->
                 if let Some(a) = args {
                     let _ = a.IsSuccess(&mut ok);
                 }
-                st.navigating.set(false);
-                st.nav_result.set(Some(ok.as_bool()));
+                st.nav_finished(ok.as_bool());
                 log(&format!("nav completed ok={}", ok.as_bool()));
                 Ok(())
             })),
@@ -302,7 +334,7 @@ fn add_handlers(wv: &ICoreWebView2, s: &Rc<Shared>, hwnd: HWND, normal: bool) ->
                     COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD => "beforeunload",
                     _ => "alert",
                 };
-                st.dialogs.borrow_mut().push(format!("{name}: {message}"));
+                st.dialog(format!("{name}: {message}"));
                 let answer = if kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT {
                     get_string(|p| a.DefaultText(p))
                 } else {

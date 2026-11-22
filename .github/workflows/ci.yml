@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [master, "feat/**", "fix/**"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: cargo build --release
+      - name: Smoke test (WebView2)
+        if: runner.os == 'Windows'
+        run: python test/smoke.py target/release/quietbrowser.exe --engine webview2
+      - name: Smoke test (Chrome)
+        if: runner.os == 'Windows'
+        run: python test/smoke.py target/release/quietbrowser.exe --engine chrome
+      - name: Smoke test with focus check (Chrome)
+        if: runner.os == 'macOS'
+        run: |
+          open -a TextEdit
+          sleep 3
+          python test/smoke.py target/release/quietbrowser
+      - name: Smoke test (Chrome under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python test/smoke.py target/release/quietbrowser
+      - name: Log on failure
+        if: failure()
+        run: |
+          for f in "$LOCALAPPDATA/quietbrowser/log.txt" "$HOME/Library/Application Support/quietbrowser/log.txt" "$HOME/.local/share/quietbrowser/log.txt"; do
+            [ -f "$f" ] && tail -n 80 "$f"
+          done
+          true
+    env:
+      QUIETBROWSER_LOG: "1"

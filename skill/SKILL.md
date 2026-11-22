@@ -1,11 +1,11 @@
 ---
 name: quietbrowser
-description: "Browse web pages on Windows without stealing the user's keyboard focus. Use when you need to open a website, read a page, click through a site, fill a form, or check a local web app (localhost) in a real browser. Prefer this over launching Chrome or a headed Playwright browser, which pull the window in front of the user."
+description: "Browse web pages without stealing the user's keyboard focus. Use when you need to open a website, read a page, click through a site, fill a form, or check a local web app (localhost) in a real browser. Prefer this over launching Chrome or a headed Playwright browser, which pull the window in front of the user."
 ---
 
 # quietbrowser
 
-`quietbrowser` drives a real browser window (Microsoft Edge WebView2) that never takes focus.
+`quietbrowser` drives a real browser window (WebView2 on Windows, your installed Chrome on macOS and Linux) that never takes focus.
 The user can keep typing while you work. Each command prints its result as plain text.
 
 ## Commands

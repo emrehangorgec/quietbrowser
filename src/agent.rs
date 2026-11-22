@@ -2,14 +2,11 @@
 // Snapshots are accessibility trees with [ref=eN] handles. Refs stay the same for an element
 // while the page stays loaded. Actions answer with only the lines that changed.
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, ExecuteScriptCompletedHandler};
-use windows::core::HSTRING;
 
-use crate::browser::{Browser, get_string, pump, sleep, wait};
+use crate::engine::{Engine, Nav, R};
 use crate::log;
 
 const MAX_NAME: usize = 100;
@@ -20,8 +17,6 @@ const TRANSPARENT: &[&str] = &[
     "generic", "none", "InlineTextBox", "LineBreak", "RootWebArea", "WebArea", "Section", "LayoutTable",
     "LayoutTableRow", "LayoutTableCell", "Pre", "Ruby", "Iframe", "LabelText", "ListMarker",
 ];
-
-type R<T> = Result<T, String>;
 
 #[derive(Default)]
 pub struct Refs {
@@ -49,48 +44,36 @@ impl Refs {
 }
 
 /// A DevTools call sent while the page swaps renderer processes can stay unanswered, so every call has a timeout.
-fn cdp(b: &Browser, method: &str, params: Value) -> R<Value> {
+fn cdp(b: &dyn Engine, method: &str, params: Value) -> R<Value> {
     let start = Instant::now();
-    let (tx, rx) = mpsc::channel();
-    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, json| {
-        let _ = tx.send(match hr {
-            Ok(()) => Ok(json),
-            Err(e) => Err(if json.is_empty() { e.message().to_string() } else { json }),
-        });
-        Ok(())
-    }));
-    unsafe {
-        b.wv.CallDevToolsProtocolMethod(&HSTRING::from(method), &HSTRING::from(params.to_string()), &handler)
-            .map_err(|e| e.to_string())?;
+    let r = b.cdp_call(method, &params, Duration::from_secs(10));
+    log(&format!("cdp {method} {} ms{}", start.elapsed().as_millis(), if r.is_err() { " failed" } else { "" }));
+    r
+}
+
+/// Runs JavaScript in the page and returns the result as JSON text.
+fn script(b: &dyn Engine, js: &str) -> R<String> {
+    let r = cdp(
+        b,
+        "Runtime.evaluate",
+        json!({ "expression": js, "returnByValue": true, "awaitPromise": true, "userGesture": true }),
+    )?;
+    if let Some(ex) = r.get("exceptionDetails") {
+        let msg = ex["exception"]["description"].as_str().or(ex["text"].as_str()).unwrap_or("error");
+        return Err(format!("page error: {}", msg.lines().next().unwrap_or("")));
     }
-    let Some(result) = wait(&rx, Duration::from_secs(10))? else {
-        log(&format!("cdp {method} TIMEOUT"));
-        return Err(format!("the page did not answer {method} within 10 s"));
-    };
-    log(&format!("cdp {method} {} ms", start.elapsed().as_millis()));
-    let text = result.map_err(|e| format!("{method} failed: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| e.to_string())
+    let v = &r["result"];
+    Ok(if v.get("value").is_some() { v["value"].to_string() } else { "null".into() })
 }
 
-fn script(b: &Browser, js: &str) -> R<String> {
-    let (tx, rx) = mpsc::channel();
-    let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, json| {
-        let _ = tx.send(hr.map(|_| json).map_err(|e| e.message().to_string()));
-        Ok(())
-    }));
-    unsafe { b.wv.ExecuteScript(&HSTRING::from(js), &handler).map_err(|e| e.to_string())? };
-    wait(&rx, Duration::from_secs(10))?.ok_or("the page did not finish the script within 10 s")?
-}
-
-pub fn init(b: &Browser) -> R<()> {
+pub fn init(b: &dyn Engine) -> R<()> {
     cdp(b, "DOM.enable", json!({}))?;
     cdp(b, "Accessibility.enable", json!({}))?;
     Ok(())
 }
 
-fn header(b: &Browser) -> String {
-    let title = get_string(|p| unsafe { b.wv.DocumentTitle(p) });
-    let url = get_string(|p| unsafe { b.wv.Source(p) });
+fn header(b: &dyn Engine) -> String {
+    let (title, url) = b.title_url();
     format!("Page: {title}\nURL: {url}")
 }
 
@@ -106,7 +89,7 @@ fn normalize(url: &str) -> String {
     }
 }
 
-pub fn run(b: &Browser, cmd: &str, args: &[String]) -> R<String> {
+pub fn run(b: &dyn Engine, cmd: &str, args: &[String]) -> R<String> {
     let short: Vec<String> = args
         .iter()
         .map(|a| if a.chars().count() > 60 { a.chars().take(60).collect::<String>() + "…" } else { a.clone() })
@@ -116,13 +99,13 @@ pub fn run(b: &Browser, cmd: &str, args: &[String]) -> R<String> {
     match cmd {
         "open" | "goto" => {
             let url = normalize(&arg(0, "url")?);
-            navigate(b, || unsafe { b.wv.Navigate(&HSTRING::from(url.as_str())) })
+            navigate(b, Nav::Url(url))
         }
-        "back" => navigate(b, || unsafe { b.wv.GoBack() }),
-        "reload" => navigate(b, || unsafe { b.wv.Reload() }),
+        "back" => navigate(b, Nav::Back),
+        "reload" => navigate(b, Nav::Reload),
         "snapshot" => {
             let snap = snapshot(b)?;
-            *b.s.last_snapshot.borrow_mut() = Some(snap.clone());
+            *b.shared().last_snapshot.lock().unwrap() = Some(snap.clone());
             Ok(format!("{}\n{snap}", header(b)))
         }
         "click" => {
@@ -166,7 +149,7 @@ pub fn run(b: &Browser, cmd: &str, args: &[String]) -> R<String> {
         }
         "eval" => script(b, &arg(0, "script")?),
         "dialogs" => {
-            let d = b.s.dialogs.borrow();
+            let d = b.shared().dialogs.lock().unwrap();
             Ok(if d.is_empty() { "No dialogs.".into() } else { d.join("\n") })
         }
         "screenshot" => {
@@ -196,35 +179,38 @@ pub fn run(b: &Browser, cmd: &str, args: &[String]) -> R<String> {
     }
 }
 
-fn navigate(b: &Browser, go: impl FnOnce() -> windows::core::Result<()>) -> R<String> {
-    b.s.nav_result.set(None);
-    go().map_err(|e| e.to_string())?;
+fn navigate(b: &dyn Engine, nav: Nav) -> R<String> {
+    let s = b.shared();
+    *s.nav_result.lock().unwrap() = None;
+    b.go(&nav)?;
     let start = Instant::now();
     // history navigations served from the back/forward cache may not raise the events
-    let finished = pump(Duration::from_secs(20), || {
-        b.s.nav_result.get().is_some() || (start.elapsed() >= Duration::from_secs(2) && !b.s.navigating.get())
+    let finished = b.pump(Duration::from_secs(20), &mut || {
+        s.nav_result.lock().unwrap().is_some() || (start.elapsed() >= Duration::from_secs(2) && !s.is_navigating())
     })?;
-    if !finished && b.s.navigating.get() {
+    if !finished && s.is_navigating() {
         return Ok(format!("Still loading after 20 s. Run snapshot later.\n{}", header(b)));
     }
     let snap = snapshot(b)?;
-    *b.s.last_snapshot.borrow_mut() = Some(snap.clone());
-    let note = if b.s.nav_result.get() == Some(false) { "\n(navigation failed)" } else { "" };
+    *s.last_snapshot.lock().unwrap() = Some(snap.clone());
+    let failed = *s.nav_result.lock().unwrap() == Some(false);
+    let note = if failed { "\n(navigation failed)" } else { "" };
     Ok(format!("{}{note}\n{snap}", header(b)))
 }
 
 /// Runs an action, waits for the page to settle, then reports what changed.
-fn after(b: &Browser, action: impl FnOnce() -> R<()>) -> R<String> {
-    let before = b.s.navigations.get();
-    let cached = b.s.last_snapshot.borrow().clone();
+fn after(b: &dyn Engine, action: impl FnOnce() -> R<()>) -> R<String> {
+    let s = b.shared();
+    let before = s.navigation_count();
+    let cached = s.last_snapshot.lock().unwrap().clone();
     let previous = match cached {
-        Some(s) => s,
+        Some(snap) => snap,
         None => snapshot(b)?,
     };
     action()?;
-    sleep(150)?;
-    let loaded = pump(Duration::from_secs(20), || !b.s.navigating.get())?;
-    sleep(100)?;
+    b.sleep(150)?;
+    let loaded = b.pump(Duration::from_secs(20), &mut || !s.is_navigating())?;
+    b.sleep(100)?;
     if !loaded {
         return Ok(format!(
             "Navigation started but the page is still loading after 20 s. Run snapshot later.\n{}",
@@ -232,15 +218,15 @@ fn after(b: &Browser, action: impl FnOnce() -> R<()>) -> R<String> {
         ));
     }
     let snap = snapshot(b)?;
-    *b.s.last_snapshot.borrow_mut() = Some(snap.clone());
-    if b.s.navigations.get() != before {
+    *s.last_snapshot.lock().unwrap() = Some(snap.clone());
+    if s.navigation_count() != before {
         return Ok(format!("Navigated.\n{}\n{snap}", header(b)));
     }
     let d = diff(&previous, &snap);
     Ok(if d.is_empty() { "No visible changes.".into() } else { format!("### Changes\n{d}") })
 }
 
-fn call_on(b: &Browser, object_id: &str, function: &str) -> R<()> {
+fn call_on(b: &dyn Engine, object_id: &str, function: &str) -> R<()> {
     let res = cdp(
         b,
         "Runtime.callFunctionOn",
@@ -254,7 +240,7 @@ fn call_on(b: &Browser, object_id: &str, function: &str) -> R<()> {
 
 /// Clicks with real mouse events at the element's center, so the page sees a user gesture
 /// (script clicks are skipped by the back button and blocked by some sites).
-fn click(b: &Browser, target: &str) -> R<()> {
+fn click(b: &dyn Engine, target: &str) -> R<()> {
     let id = resolve(b, target)?;
     let Some((x, y)) = center(b, &id)? else {
         return call_on(b, &id, "function(){this.click()}"); // not rendered as a box, fall back
@@ -267,7 +253,7 @@ fn click(b: &Browser, target: &str) -> R<()> {
 }
 
 /// Scrolls the element into view and returns its center in page coordinates, if it has a box.
-fn center(b: &Browser, id: &str) -> R<Option<(f64, f64)>> {
+fn center(b: &dyn Engine, id: &str) -> R<Option<(f64, f64)>> {
     call_on(b, id, "function(){this.scrollIntoView({block:'center',inline:'center'})}")?;
     let quads = cdp(b, "DOM.getContentQuads", json!({ "objectId": id }))?;
     let Some(q) = quads["quads"].as_array().and_then(|a| a.first()).and_then(|q| q.as_array()) else {
@@ -280,14 +266,14 @@ fn center(b: &Browser, id: &str) -> R<Option<(f64, f64)>> {
     Ok(Some(((q[0] + q[2] + q[4] + q[6]) / 4.0, (q[1] + q[3] + q[5] + q[7]) / 4.0)))
 }
 
-fn hover(b: &Browser, target: &str) -> R<()> {
+fn hover(b: &dyn Engine, target: &str) -> R<()> {
     let id = resolve(b, target)?;
     let (x, y) = center(b, &id)?.ok_or_else(|| format!("{target} has no box to hover"))?;
     cdp(b, "Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y })).map(|_| ())
 }
 
 /// Selects options of a <select> by value or label and fires input and change events.
-fn select(b: &Browser, target: &str, values: &[String]) -> R<()> {
+fn select(b: &dyn Engine, target: &str, values: &[String]) -> R<()> {
     let id = resolve(b, target)?;
     let res = cdp(
         b,
@@ -309,7 +295,7 @@ fn select(b: &Browser, target: &str, values: &[String]) -> R<()> {
 }
 
 /// Focuses the field, selects what is in it and types the new text over it.
-fn fill(b: &Browser, target: &str, text: &str) -> R<()> {
+fn fill(b: &dyn Engine, target: &str, text: &str) -> R<()> {
     let id = resolve(b, target)?;
     call_on(
         b,
@@ -326,8 +312,8 @@ fn fill(b: &Browser, target: &str, text: &str) -> R<()> {
 }
 
 /// A ref from the last snapshot (e12), or a CSS selector.
-fn resolve(b: &Browser, target: &str) -> R<String> {
-    let node = b.s.refs.borrow().by_ref.get(target).copied();
+fn resolve(b: &dyn Engine, target: &str) -> R<String> {
+    let node = b.shared().refs.lock().unwrap().by_ref.get(target).copied();
     if let Some(node) = node {
         cdp(b, "DOM.getDocument", json!({ "depth": 0 }))?;
         let res = cdp(b, "DOM.resolveNode", json!({ "backendNodeId": node }))?;
@@ -342,7 +328,7 @@ fn resolve(b: &Browser, target: &str) -> R<String> {
     res["result"]["objectId"].as_str().map(String::from).ok_or_else(|| format!("no element matches {target}"))
 }
 
-fn press(b: &Browser, key: &str) -> R<()> {
+fn press(b: &dyn Engine, key: &str) -> R<()> {
     let (code, text, vk): (String, String, u32) = match key {
         "Enter" => ("Enter".into(), "\r".into(), 13),
         "Tab" => ("Tab".into(), "".into(), 9),
@@ -365,7 +351,7 @@ fn press(b: &Browser, key: &str) -> R<()> {
     Ok(())
 }
 
-fn snapshot(b: &Browser) -> R<String> {
+fn snapshot(b: &dyn Engine) -> R<String> {
     let tree = cdp(b, "Accessibility.getFullAXTree", json!({}))?;
     let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
     if nodes.is_empty() {
@@ -373,7 +359,7 @@ fn snapshot(b: &Browser) -> R<String> {
     }
     let by_id: HashMap<&str, &Value> = nodes.iter().filter_map(|n| Some((n["nodeId"].as_str()?, n))).collect();
     let mut lines = Vec::new();
-    let mut refs = b.s.refs.borrow_mut();
+    let mut refs = b.shared().refs.lock().unwrap();
     render(&nodes[0], 0, "", &by_id, &mut lines, &mut refs);
     if lines.len() > MAX_LINES {
         let more = lines.len() - MAX_LINES;
