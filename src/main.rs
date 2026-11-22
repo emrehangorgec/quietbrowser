@@ -106,6 +106,10 @@ fn main() {
         }
         Some("serve") => serve(&args[1..]),
         Some("mcp") => mcp::serve(),
+        Some("-V" | "--version" | "version") => {
+            println!("quietbrowser {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         Some(cmd) => match client(cmd, &args[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -260,21 +264,25 @@ fn client(cmd: &str, args: &[String]) -> Result<i32, String> {
 
 fn install_skill() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let on_path = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(';')
-        .any(|d| !d.trim().is_empty() && std::path::Path::new(d.trim()).join("quietbrowser.exe").is_file());
     let mut text = SKILL.replace("\r\n", "\n");
-    if !on_path {
-        // Not on PATH: tell the agent the full path on this machine.
-        if let Some(i) = text[3..].find("---") {
-            let end = i + 6;
-            let note = format!(
-                "\n\nOn this machine the CLI is not on PATH. Run it as `& \"{0}\"` in PowerShell or `\"{0}\"` in bash.\n",
-                exe.display()
-            );
-            text.insert_str(end, &note);
+    // How the agent should run it later: the npm wrapper says so, otherwise use the full path
+    // unless quietbrowser.exe is on PATH.
+    let how = match std::env::var("QUIETBROWSER_LAUNCHER") {
+        Ok(l) if l.trim() == "quietbrowser" => None,
+        Ok(l) if !l.trim().is_empty() => Some(format!("Run it as `{} <command>`.", l.trim())),
+        _ => {
+            let on_path = std::env::var("PATH")
+                .unwrap_or_default()
+                .split(';')
+                .any(|d| !d.trim().is_empty() && std::path::Path::new(d.trim()).join("quietbrowser.exe").is_file());
+            (!on_path).then(|| {
+                let p = exe.display();
+                format!("Run it as `& \"{p}\"` in PowerShell or `\"{p}\"` in bash.")
+            })
         }
+    };
+    if let (Some(how), Some(i)) = (how, text[3..].find("---")) {
+        text.insert_str(i + 6, &format!("\n\nOn this machine `quietbrowser` is not on PATH. {how}\n"));
     }
     let home = std::env::var("USERPROFILE").map_err(|e| e.to_string())?;
     let dir = std::path::Path::new(&home).join(".claude").join("skills").join("quietbrowser");

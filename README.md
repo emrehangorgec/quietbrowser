@@ -65,29 +65,32 @@ After an action you get only what changed, which keeps agent context small:
 
 ## Install
 
-One file, about 0.5 MB, for Windows 10 and 11 (x64). Download it from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) or in PowerShell:
+With Node.js, one line adds it to your agent as an MCP server:
+
+```
+claude mcp add quietbrowser -- npx -y quietbrowser mcp
+codex mcp add quietbrowser -- npx -y quietbrowser mcp
+```
+
+The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
+
+Without Node.js, download the exe (one file, about 0.5 MB, Windows 10 and 11 x64) from [Releases](https://github.com/emrehangorgec/quietbrowser/releases/latest) or in PowerShell, and add that path instead of `npx -y quietbrowser`:
 
 ```powershell
 mkdir "$env:LOCALAPPDATA\quietbrowser\bin" -Force
 curl.exe -L -o "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" https://github.com/emrehangorgec/quietbrowser/releases/latest/download/quietbrowser.exe
-```
-
-## Use it from your agent
-
-As an MCP server. The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them:
-
-```powershell
 claude mcp add quietbrowser -- "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" mcp
-codex mcp add quietbrowser -- "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" mcp
 ```
 
-Or as a command line tool with a skill that tells Claude Code when and how to use it:
+## Command line and skill
 
-```powershell
-& "$env:LOCALAPPDATA\quietbrowser\bin\quietbrowser.exe" install-skill
+Instead of MCP, agents can call the command line tool. This installs a skill in `~/.claude/skills/quietbrowser` that tells Claude Code when and how to use it:
+
+```
+npx -y quietbrowser install-skill
 ```
 
-The skill goes to `~/.claude/skills/quietbrowser` and includes the path to the exe. Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
+Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
 
 ## How it works
 

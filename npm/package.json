@@ -1,0 +1,24 @@
+{
+  "name": "quietbrowser",
+  "version": "0.2.1",
+  "description": "A browser for coding agents on Windows that never steals your focus. MCP server with Playwright MCP tool names, plus a CLI.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emrehangorgec/quietbrowser.git"
+  },
+  "homepage": "https://github.com/emrehangorgec/quietbrowser#readme",
+  "bugs": "https://github.com/emrehangorgec/quietbrowser/issues",
+  "keywords": ["mcp", "mcp-server", "browser", "claude-code", "codex", "playwright", "windows", "webview2", "ai-agents"],
+  "bin": {
+    "quietbrowser": "bin/quietbrowser.js"
+  },
+  "files": ["bin", "quietbrowser.exe"],
+  "os": ["win32"],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "prepack": "node prepack.js"
+  }
+}
