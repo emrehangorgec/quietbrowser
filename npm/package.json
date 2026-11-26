@@ -1,6 +1,6 @@
 {
   "name": "quietbrowser",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "One browser for all your coding agents: each gets its own tabs, they share your logins, and none of them steals your focus. Windows, macOS and Linux. MCP server with Playwright MCP tool names, plus a CLI.",
   "license": "MIT",
   "repository": {

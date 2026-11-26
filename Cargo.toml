@@ -1,6 +1,6 @@
 [package]
 name = "quietbrowser"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "One browser for all your coding agents, and it never steals your focus"
 license = "MIT"
