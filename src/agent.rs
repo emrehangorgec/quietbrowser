@@ -1,7 +1,11 @@
 // The commands an agent runs: open, snapshot, click, fill, type, press, text, eval, back, dialogs, ...
 // Snapshots are accessibility trees with [ref=eN] handles. Refs stay the same for an element
 // while the page stays loaded. Actions answer with only the lines that changed.
+// Every command comes from a session (one per agent). Each session has its own tabs, so agents
+// working at the same time do not get in each other's way.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -12,6 +16,9 @@ use crate::log;
 const MAX_NAME: usize = 100;
 const MAX_LINES: usize = 1500;
 const MAX_TEXT_BYTES: usize = 50_000;
+const MAX_LIST: usize = 200;
+const MAX_FRAMES: usize = 300;
+const FRAME_MS: u16 = 1200;
 
 const TRANSPARENT: &[&str] = &[
     "generic", "none", "InlineTextBox", "LineBreak", "RootWebArea", "WebArea", "Section", "LayoutTable",
@@ -66,10 +73,293 @@ fn script(b: &dyn Engine, js: &str) -> R<String> {
     Ok(if v.get("value").is_some() { v["value"].to_string() } else { "null".into() })
 }
 
+/// Prepares the selected tab: the domains the snapshots, the console and the network list need.
 pub fn init(b: &dyn Engine) -> R<()> {
-    cdp(b, "DOM.enable", json!({}))?;
-    cdp(b, "Accessibility.enable", json!({}))?;
+    for domain in ["DOM", "Accessibility", "Runtime", "Network", "Log"] {
+        cdp(b, &format!("{domain}.enable"), json!({}))?;
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct Session {
+    tabs: Vec<u32>,
+    current: u32,
+    /// Screenshots taken while recording.
+    frames: Option<Vec<Vec<u8>>>,
+}
+
+static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Default::default);
+static EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Close the whole browser after answering.
+pub fn exit_requested() {
+    EXIT.store(true, Ordering::SeqCst);
+}
+
+pub fn should_exit() -> bool {
+    EXIT.load(Ordering::SeqCst)
+}
+
+/// Runs a command for a session on that session's selected tab. A session's first command takes the
+/// tab nobody uses yet, or opens a new one in the background.
+pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<String> {
+    let live = b.tabs();
+    let mut sessions = SESSIONS.lock().unwrap();
+    for s in sessions.values_mut() {
+        s.tabs.retain(|t| live.contains(t));
+    }
+    let others = |sessions: &HashMap<String, Session>| -> usize {
+        sessions.iter().filter(|(name, _)| name.as_str() != session).map(|(_, s)| s.tabs.len()).sum()
+    };
+
+    if cmd == "quit" {
+        // The last session to leave closes the browser.
+        if others(&sessions) == 0 {
+            exit_requested();
+            return Ok("closed".into());
+        }
+        if let Some(gone) = sessions.remove(session) {
+            for t in gone.tabs {
+                let _ = b.close_tab(t);
+            }
+        }
+        show_any(b);
+        return Ok("closed".into());
+    }
+
+    if sessions.get(session).is_none_or(|s| s.tabs.is_empty()) {
+        let owned: Vec<u32> = sessions.values().flat_map(|s| s.tabs.iter().copied()).collect();
+        let id = match live.iter().copied().find(|t| !owned.contains(t)) {
+            Some(free) => {
+                b.select_tab(free)?;
+                free
+            }
+            None => {
+                let id = b.new_tab()?;
+                init(b)?;
+                id
+            }
+        };
+        let s = sessions.entry(session.to_string()).or_default();
+        s.tabs = vec![id];
+        s.current = id;
+    }
+    let others_have_tabs = others(&sessions) > 0;
+    let sess = sessions.get_mut(session).unwrap();
+    if !sess.tabs.contains(&sess.current) {
+        sess.current = *sess.tabs.last().unwrap();
+    }
+    b.select_tab(sess.current)?;
+
+    let result = match cmd {
+        "tabs" => Ok(list_tabs(b, sess)),
+        "tab" => tab(b, sess, args, others_have_tabs),
+        "record" => record(b, sess, args),
+        "__attention" => {
+            b.attention();
+            Ok("ok".into())
+        }
+        _ => run(b, cmd, args),
+    };
+    if result.is_ok() && cmd != "__has_text" && cmd != "record" {
+        if let Some(frames) = sess.frames.as_mut() {
+            capture(b, frames);
+        }
+    }
+    result
+}
+
+/// After closing the selected tab, selects another one, so the window does not stay empty.
+fn show_any(b: &dyn Engine) {
+    if let Some(&t) = b.tabs().first() {
+        let _ = b.select_tab(t);
+    }
+}
+
+fn list_tabs(b: &dyn Engine, sess: &Session) -> String {
+    let lines: Vec<String> = sess
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let (title, url) = b.tab_info(id);
+            let mark = if id == sess.current { "(current) " } else { "" };
+            format!("- {i}: {mark}[{title}]({url})")
+        })
+        .collect();
+    format!("### Open tabs\n{}", lines.join("\n"))
+}
+
+/// `tab new [url]`, `tab select <index>`, `tab close [index]`, or just `tab <index>`.
+fn tab(b: &dyn Engine, sess: &mut Session, args: &[String], others_have_tabs: bool) -> R<String> {
+    let index = |a: Option<&String>| -> R<u32> {
+        let Some(a) = a else { return Ok(sess.current) };
+        let i: usize = a.parse().map_err(|_| format!("tab: {a} is not a tab index"))?;
+        sess.tabs.get(i).copied().ok_or_else(|| format!("tab: there is no tab {i}, run tabs"))
+    };
+    let action = args.first().map(String::as_str).unwrap_or("");
+    match action {
+        "new" => {
+            let id = b.new_tab()?;
+            init(b)?;
+            sess.tabs.push(id);
+            sess.current = id;
+            match args.get(1) {
+                Some(url) => navigate(b, Nav::Url(normalize(url))),
+                None => Ok(list_tabs(b, sess)),
+            }
+        }
+        "close" => {
+            let id = index(args.get(1))?;
+            sess.tabs.retain(|&t| t != id);
+            if sess.tabs.is_empty() && !others_have_tabs {
+                exit_requested();
+                return Ok("Closed the last tab.".into());
+            }
+            b.close_tab(id)?;
+            if sess.tabs.is_empty() {
+                show_any(b);
+                return Ok("Closed the last tab of this session.".into());
+            }
+            if sess.current == id {
+                sess.current = *sess.tabs.last().unwrap();
+            }
+            b.select_tab(sess.current)?;
+            Ok(list_tabs(b, sess))
+        }
+        "" => Ok(list_tabs(b, sess)),
+        "select" => {
+            let id = index(Some(args.get(1).ok_or("tab select: missing index")?))?;
+            select_and_show(b, sess, id)
+        }
+        n if n.parse::<usize>().is_ok() => {
+            let id = index(Some(&n.to_string()))?;
+            select_and_show(b, sess, id)
+        }
+        _ => Err("tab: use new [url], select <index> or close [index]".into()),
+    }
+}
+
+fn select_and_show(b: &dyn Engine, sess: &mut Session, id: u32) -> R<String> {
+    b.select_tab(id)?;
+    sess.current = id;
+    let snap = snapshot(b)?;
+    *b.shared().last_snapshot.lock().unwrap() = Some(snap.clone());
+    Ok(format!("{}\n{}\n{snap}", list_tabs(b, sess), header(b)))
+}
+
+/// `record start`, `record stop [file.png]`: an animated PNG with one frame per command.
+fn record(b: &dyn Engine, sess: &mut Session, args: &[String]) -> R<String> {
+    match args.first().map(String::as_str) {
+        Some("start") => {
+            let mut frames = Vec::new();
+            capture(b, &mut frames);
+            sess.frames = Some(frames);
+            Ok("Recording. Every command adds a frame. Run record stop [file.png] to save it.".into())
+        }
+        Some("stop") => {
+            let frames = sess.frames.take().ok_or("record: not recording, run record start first")?;
+            let (data, n) = crate::apng::encode(&frames, FRAME_MS)?;
+            let path = match args.get(1) {
+                Some(p) => std::path::absolute(p).map_err(|e| e.to_string())?,
+                None => std::env::temp_dir().join(format!("quietbrowser-{}.png", crate::timestamp())),
+            };
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, data).map_err(|e| e.to_string())?;
+            Ok(format!("{}\n({n} frames, an animated PNG that plays in browsers and on GitHub)", path.display()))
+        }
+        _ => Err("record: use start or stop [file.png]".into()),
+    }
+}
+
+/// Adds a screenshot of the tab, unless nothing changed since the last one.
+fn capture(b: &dyn Engine, frames: &mut Vec<Vec<u8>>) {
+    if frames.len() >= MAX_FRAMES {
+        return;
+    }
+    let shot = cdp(b, "Page.captureScreenshot", json!({ "format": "png" }));
+    let Some(data) = shot.ok().and_then(|s| crate::base64_decode(s["data"].as_str().unwrap_or_default()).ok()) else {
+        return;
+    };
+    if frames.last() != Some(&data) {
+        frames.push(data);
+    }
+}
+
+/// Console messages of the selected tab: since the page loaded, or `all` that were kept, or `errors`.
+fn console(b: &dyn Engine, mode: &str) -> R<String> {
+    let s = b.shared();
+    let load = s.navigation_count();
+    let c = s.console.lock().unwrap();
+    let lines: Vec<String> = c
+        .iter()
+        .filter(|e| mode == "all" || e.load == load)
+        .filter(|e| mode != "errors" || e.level == "error")
+        .map(|e| format!("[{}] {}", e.level, e.text))
+        .collect();
+    if lines.is_empty() {
+        let what = if mode == "errors" { "errors" } else { "messages" };
+        let when = if mode == "all" { "" } else { " since the page loaded" };
+        return Ok(format!("No console {what}{when}."));
+    }
+    Ok(last_lines(lines))
+}
+
+/// Requests of the selected tab since the page loaded (or `all`), or only the `failed` ones.
+fn network(b: &dyn Engine, mode: &str) -> R<String> {
+    let s = b.shared();
+    let load = s.navigation_count();
+    let reqs = s.requests.lock().unwrap();
+    let lines: Vec<String> = reqs
+        .iter()
+        .filter(|r| mode == "all" || r.load == load)
+        .filter(|r| {
+            mode != "failed" || r.status.is_some_and(|c| c >= 400) || r.failed.as_deref().is_some_and(|f| f != "canceled")
+        })
+        .map(|r| {
+            let state = match (&r.failed, r.status) {
+                (Some(f), _) => format!("failed {f}"),
+                (None, Some(code)) => code.to_string(),
+                (None, None) => "pending".into(),
+            };
+            let url = if r.url.chars().count() > 200 { r.url.chars().take(200).collect::<String>() + "…" } else { r.url.clone() };
+            format!("{} {state} {url} ({})", r.method, r.kind.to_lowercase())
+        })
+        .collect();
+    if lines.is_empty() {
+        let what = if mode == "failed" { "No failed requests" } else { "No requests" };
+        let when = if mode == "all" { "" } else { " since the page loaded" };
+        return Ok(format!("{what}{when}."));
+    }
+    Ok(last_lines(lines))
+}
+
+fn last_lines(mut lines: Vec<String>) -> String {
+    if lines.len() > MAX_LIST {
+        let skipped = lines.len() - MAX_LIST;
+        lines.drain(..skipped);
+        lines.insert(0, format!("[{skipped} earlier lines]"));
+    }
+    lines.join("\n")
+}
+
+/// Console errors logged since `since` (a console sequence number), as a section to append.
+fn new_errors(b: &dyn Engine, since: u64) -> String {
+    let s = b.shared();
+    let c = s.console.lock().unwrap();
+    let errors: Vec<&str> = c.iter().filter(|e| e.seq >= since && e.level == "error").map(|e| e.text.as_str()).collect();
+    if errors.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n### Console errors\n");
+    out.push_str(&errors.iter().take(5).map(|e| format!("[error] {e}")).collect::<Vec<_>>().join("\n"));
+    if errors.len() > 5 {
+        out.push_str(&format!("\n({} more, run console errors)", errors.len() - 5));
+    }
+    out
 }
 
 fn header(b: &dyn Engine) -> String {
@@ -149,8 +439,32 @@ pub fn run(b: &dyn Engine, cmd: &str, args: &[String]) -> R<String> {
         }
         "eval" => script(b, &arg(0, "script")?),
         "dialogs" => {
-            let d = b.shared().dialogs.lock().unwrap();
+            let s = b.shared();
+            let d = s.dialogs.lock().unwrap();
             Ok(if d.is_empty() { "No dialogs.".into() } else { d.join("\n") })
+        }
+        "console" => console(b, args.first().map(String::as_str).unwrap_or("")),
+        "network" => network(b, args.first().map(String::as_str).unwrap_or("")),
+        // used by `wait`, which polls from the client so other sessions are not held up
+        "__has_text" => {
+            let text = arg(0, "text")?;
+            let gone = args.get(1).is_some_and(|g| g == "gone");
+            let js = format!("(document.body ? document.body.innerText : '').includes({})", Value::from(text));
+            let found = script(b, &js)? == "true";
+            Ok(if found != gone { "yes".into() } else { "no".into() })
+        }
+        "__changes" => {
+            let s = b.shared();
+            let previous = s.last_snapshot.lock().unwrap().clone();
+            let snap = snapshot(b)?;
+            *s.last_snapshot.lock().unwrap() = Some(snap.clone());
+            Ok(match previous {
+                Some(p) => {
+                    let d = diff(&p, &snap);
+                    if d.is_empty() { "No visible changes.".into() } else { format!("### Changes\n{d}") }
+                }
+                None => format!("{}\n{snap}", header(b)),
+            })
         }
         "screenshot" => {
             let path = match args.first() {
@@ -181,6 +495,7 @@ pub fn run(b: &dyn Engine, cmd: &str, args: &[String]) -> R<String> {
 
 fn navigate(b: &dyn Engine, nav: Nav) -> R<String> {
     let s = b.shared();
+    let since = s.console_seq();
     *s.nav_result.lock().unwrap() = None;
     b.go(&nav)?;
     let start = Instant::now();
@@ -195,7 +510,7 @@ fn navigate(b: &dyn Engine, nav: Nav) -> R<String> {
     *s.last_snapshot.lock().unwrap() = Some(snap.clone());
     let failed = *s.nav_result.lock().unwrap() == Some(false);
     let note = if failed { "\n(navigation failed)" } else { "" };
-    Ok(format!("{}{note}\n{snap}", header(b)))
+    Ok(format!("{}{note}\n{snap}{}", header(b), new_errors(b, since)))
 }
 
 /// Runs an action, waits for the page to settle, then reports what changed.
@@ -207,6 +522,7 @@ fn after(b: &dyn Engine, action: impl FnOnce() -> R<()>) -> R<String> {
         Some(snap) => snap,
         None => snapshot(b)?,
     };
+    let since = s.console_seq();
     action()?;
     b.sleep(150)?;
     let loaded = b.pump(Duration::from_secs(20), &mut || !s.is_navigating())?;
@@ -219,11 +535,12 @@ fn after(b: &dyn Engine, action: impl FnOnce() -> R<()>) -> R<String> {
     }
     let snap = snapshot(b)?;
     *s.last_snapshot.lock().unwrap() = Some(snap.clone());
+    let errors = new_errors(b, since);
     if s.navigation_count() != before {
-        return Ok(format!("Navigated.\n{}\n{snap}", header(b)));
+        return Ok(format!("Navigated.\n{}\n{snap}{errors}", header(b)));
     }
     let d = diff(&previous, &snap);
-    Ok(if d.is_empty() { "No visible changes.".into() } else { format!("### Changes\n{d}") })
+    Ok(if d.is_empty() { format!("No visible changes.{errors}") } else { format!("### Changes\n{d}{errors}") })
 }
 
 fn call_on(b: &dyn Engine, object_id: &str, function: &str) -> R<()> {
@@ -359,7 +676,8 @@ fn snapshot(b: &dyn Engine) -> R<String> {
     }
     let by_id: HashMap<&str, &Value> = nodes.iter().filter_map(|n| Some((n["nodeId"].as_str()?, n))).collect();
     let mut lines = Vec::new();
-    let mut refs = b.shared().refs.lock().unwrap();
+    let shared = b.shared();
+    let mut refs = shared.refs.lock().unwrap();
     render(&nodes[0], 0, "", &by_id, &mut lines, &mut refs);
     if lines.len() > MAX_LINES {
         let more = lines.len() - MAX_LINES;

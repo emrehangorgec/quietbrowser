@@ -2,11 +2,11 @@
 // Everything here runs on the UI thread. Waits pump the message loop, so WebView2 keeps working.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler, NavigationCompletedEventHandler, ScriptDialogOpeningEventHandler, NewWindowRequestedEventHandler, DownloadStartingEventHandler};
+use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler, NavigationCompletedEventHandler, ScriptDialogOpeningEventHandler, NewWindowRequestedEventHandler, DownloadStartingEventHandler, DevToolsProtocolEventReceivedEventHandler};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -17,19 +17,46 @@ use windows::core::*;
 use crate::engine::{Engine, Nav, Shared};
 use crate::log;
 
+/// A tab is a WebView2 control in the window. Only the selected one is visible.
+#[derive(Clone)]
+struct Tab {
+    id: u32,
+    controller: ICoreWebView2Controller,
+    wv: ICoreWebView2,
+    s: Arc<Shared>,
+}
+
 pub struct Browser {
     pub hwnd: HWND,
-    pub controller: ICoreWebView2Controller,
-    pub wv: ICoreWebView2,
-    pub s: Rc<Shared>,
+    env: ICoreWebView2Environment,
+    normal: bool,
+    tabs: RefCell<Vec<Tab>>,
+    current: Cell<u32>,
+    next_tab: Cell<u32>,
+}
+
+impl Browser {
+    fn tab(&self) -> std::result::Result<Tab, String> {
+        let id = self.current.get();
+        self.tabs.borrow().iter().find(|t| t.id == id).cloned().ok_or_else(|| "the tab was closed".to_string())
+    }
+
+    fn fit(&self, tab: &Tab) {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut r);
+            let _ = tab.controller.SetBounds(r);
+        }
+    }
 }
 
 impl Engine for Browser {
-    fn shared(&self) -> &Shared {
-        &self.s
+    fn shared(&self) -> Arc<Shared> {
+        self.tab().map(|t| t.s).unwrap_or_default()
     }
 
     fn cdp_call(&self, method: &str, params: &serde_json::Value, timeout: Duration) -> std::result::Result<serde_json::Value, String> {
+        let wv = self.tab()?.wv;
         let (tx, rx) = mpsc::channel();
         let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, json| {
             let _ = tx.send(match hr {
@@ -39,7 +66,7 @@ impl Engine for Browser {
             Ok(())
         }));
         unsafe {
-            self.wv
+            wv
                 .CallDevToolsProtocolMethod(&HSTRING::from(method), &HSTRING::from(params.to_string()), &handler)
                 .map_err(|e| e.to_string())?;
         }
@@ -55,18 +82,91 @@ impl Engine for Browser {
     }
 
     fn go(&self, nav: &Nav) -> std::result::Result<(), String> {
+        let wv = self.tab()?.wv;
         unsafe {
             match nav {
-                Nav::Url(url) => self.wv.Navigate(&HSTRING::from(url.as_str())),
-                Nav::Back => self.wv.GoBack(),
-                Nav::Reload => self.wv.Reload(),
+                Nav::Url(url) => wv.Navigate(&HSTRING::from(url.as_str())),
+                Nav::Back => wv.GoBack(),
+                Nav::Reload => wv.Reload(),
             }
         }
         .map_err(|e| e.to_string())
     }
 
     fn title_url(&self) -> (String, String) {
-        (get_string(|p| unsafe { self.wv.DocumentTitle(p) }), get_string(|p| unsafe { self.wv.Source(p) }))
+        self.tab_info(self.current.get())
+    }
+
+    fn tabs(&self) -> Vec<u32> {
+        self.tabs.borrow().iter().map(|t| t.id).collect()
+    }
+
+    fn new_tab(&self) -> std::result::Result<u32, String> {
+        let controller = {
+            let (tx, rx) = mpsc::channel();
+            let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |hr, c| {
+                let _ = tx.send(hr.and_then(|_| c.ok_or_else(|| Error::from(E_POINTER))));
+                Ok(())
+            }));
+            unsafe { self.env.CreateCoreWebView2Controller(self.hwnd, &handler) }.map_err(|e| e.to_string())?;
+            wait(&rx, Duration::from_secs(60))?.ok_or("WebView2 did not start")?.map_err(|e| e.to_string())?
+        };
+        let wv = unsafe { controller.CoreWebView2() }.map_err(|e| e.to_string())?;
+        unsafe {
+            controller.SetIsVisible(false).map_err(|e| e.to_string())?;
+            // otherwise WebView2 shows its own modal dialogs
+            let settings = wv.Settings().map_err(|e| e.to_string())?;
+            settings.SetAreDefaultScriptDialogsEnabled(false).map_err(|e| e.to_string())?;
+        }
+        let s = Arc::new(Shared::default());
+        add_handlers(&wv, &s, self.hwnd, self.normal).map_err(|e| e.to_string())?;
+        let id = self.next_tab.get();
+        self.next_tab.set(id + 1);
+        self.tabs.borrow_mut().push(Tab { id, controller, wv, s });
+        self.select_tab(id)?;
+        Ok(id)
+    }
+
+    fn select_tab(&self, id: u32) -> std::result::Result<(), String> {
+        let tabs = self.tabs.borrow().clone();
+        let tab = tabs.iter().find(|t| t.id == id).ok_or("the tab was closed")?;
+        self.current.set(id);
+        self.fit(tab);
+        unsafe {
+            tab.controller.SetIsVisible(true).map_err(|e| e.to_string())?;
+            for other in tabs.iter().filter(|t| t.id != id) {
+                let _ = other.controller.SetIsVisible(false);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_tab(&self, id: u32) -> std::result::Result<(), String> {
+        let tab = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(i) = tabs.iter().position(|t| t.id == id) else { return Ok(()) };
+            tabs.remove(i)
+        };
+        unsafe { tab.controller.Close() }.map_err(|e| e.to_string())
+    }
+
+    fn tab_info(&self, id: u32) -> (String, String) {
+        let Some(t) = self.tabs.borrow().iter().find(|t| t.id == id).cloned() else { return Default::default() };
+        (get_string(|p| unsafe { t.wv.DocumentTitle(p) }), get_string(|p| unsafe { t.wv.Source(p) }))
+    }
+
+    /// Flashes the taskbar button. Unlike bringing the window up, this leaves focus where it is.
+    fn attention(&self) {
+        let info = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd: self.hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        unsafe {
+            let _ = FlashWindowEx(&info);
+        }
     }
 }
 
@@ -147,22 +247,22 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
         WM_ACTIVATE if !normal && (wparam.0 & 0xFFFF) == 0 => set_no_activate(hwnd, true),
         WM_SETFOCUS => {
-            if let Some(b) = current() {
-                unsafe { let _ = b.controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC); }
+            if let Some(t) = current().and_then(|b| b.tab().ok()) {
+                unsafe { let _ = t.controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC); }
             }
         }
         WM_SIZE => {
             if let Some(b) = current() {
-                let mut r = RECT::default();
-                unsafe {
-                    let _ = GetClientRect(hwnd, &mut r);
-                    let _ = b.controller.SetBounds(r);
+                for t in b.tabs.borrow().iter() {
+                    b.fit(t);
                 }
             }
         }
         WM_MOVE => {
             if let Some(b) = current() {
-                unsafe { let _ = b.controller.NotifyParentWindowPositionChanged(); }
+                for t in b.tabs.borrow().iter() {
+                    unsafe { let _ = t.controller.NotifyParentWindowPositionChanged(); }
+                }
             }
         }
         WM_DPICHANGED => {
@@ -194,13 +294,16 @@ fn run_queued() {
     }
     while let Some(job) = crate::server::next_job() {
         let result = match current() {
-            Some(b) if job.cmd == crate::server::QUIT => {
-                unsafe { let _ = PostMessageW(Some(b.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); }
+            Some(_) if job.cmd == crate::server::QUIT => {
+                crate::agent::exit_requested();
                 Ok("bye".into())
             }
-            Some(b) => crate::agent::run(&*b, &job.cmd, &job.args),
+            Some(b) => crate::agent::dispatch(&*b, &job.session, &job.cmd, &job.args),
             None => Err("the browser is not ready".into()),
         };
+        if let Some(b) = current().filter(|_| crate::agent::should_exit()) {
+            unsafe { let _ = PostMessageW(Some(b.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); }
+        }
         let _ = job.reply.send(result);
     }
     BUSY.with(|b| b.set(false));
@@ -260,34 +363,20 @@ pub fn create(normal: bool) -> std::result::Result<Rc<Browser>, String> {
             .map_err(|e| format!("WebView2 runtime not found: {e}"))?;
         wait(&rx, long)?.ok_or("WebView2 did not start")?.map_err(|e| e.to_string())?
     };
-    let controller = {
-        let (tx, rx) = mpsc::channel();
-        let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |hr, c| {
-            let _ = tx.send(hr.and_then(|_| c.ok_or_else(|| Error::from(E_POINTER))));
-            Ok(())
-        }));
-        unsafe { env.CreateCoreWebView2Controller(hwnd, &handler) }.map_err(|e| e.to_string())?;
-        wait(&rx, long)?.ok_or("WebView2 did not start")?.map_err(|e| e.to_string())?
-    };
-    let wv = unsafe { controller.CoreWebView2() }.map_err(|e| e.to_string())?;
-    unsafe {
-        let mut r = RECT::default();
-        let _ = GetClientRect(hwnd, &mut r);
-        controller.SetBounds(r).map_err(|e| e.to_string())?;
-        controller.SetIsVisible(true).map_err(|e| e.to_string())?;
-        // otherwise WebView2 shows its own modal dialogs
-        let settings = wv.Settings().map_err(|e| e.to_string())?;
-        settings.SetAreDefaultScriptDialogsEnabled(false).map_err(|e| e.to_string())?;
-    }
-
-    let s = Rc::new(Shared::default());
-    add_handlers(&wv, &s, hwnd, normal).map_err(|e| e.to_string())?;
-    let b = Rc::new(Browser { hwnd, controller, wv, s });
+    let b = Rc::new(Browser {
+        hwnd,
+        env,
+        normal,
+        tabs: RefCell::new(Vec::new()),
+        current: Cell::new(0),
+        next_tab: Cell::new(1),
+    });
     BROWSER.with(|x| *x.borrow_mut() = Some(b.clone()));
+    b.new_tab()?;
     Ok(b)
 }
 
-fn add_handlers(wv: &ICoreWebView2, s: &Rc<Shared>, hwnd: HWND, normal: bool) -> Result<()> {
+fn add_handlers(wv: &ICoreWebView2, s: &Arc<Shared>, hwnd: HWND, normal: bool) -> Result<()> {
     let mut token = 0i64;
     unsafe {
         let st = s.clone();
@@ -357,6 +446,24 @@ fn add_handlers(wv: &ICoreWebView2, s: &Rc<Shared>, hwnd: HWND, normal: bool) ->
             })),
             &mut token,
         )?;
+
+        // console messages, errors and requests, read by the console and network commands
+        for name in crate::engine::EVENTS {
+            let receiver = wv.GetDevToolsProtocolEventReceiver(&HSTRING::from(*name))?;
+            let st = s.clone();
+            receiver.add_DevToolsProtocolEventReceived(
+                &DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+                    if let Some(a) = args {
+                        let json = get_string(|p| a.ParameterObjectAsJson(p));
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                            st.cdp_event(name, &v);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
 
         if let Ok(wv4) = wv.cast::<ICoreWebView2_4>() {
             wv4.add_DownloadStarting(

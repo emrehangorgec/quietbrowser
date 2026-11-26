@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,15 +16,6 @@ use crate::engine::{Engine, Nav, R, Shared};
 use crate::{log, ws};
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
-
-pub struct Chrome {
-    writer: Arc<Mutex<ws::Writer>>,
-    pending: Pending,
-    next_id: Arc<AtomicU64>,
-    s: Arc<Shared>,
-    port: u16,
-    browser_ws: String,
-}
 
 /// Runs in every page before its own scripts: popups and target=_blank links open in the same
 /// window, so no new window can come to the front.
@@ -204,6 +195,47 @@ fn launch(profile: &Path) -> R<()> {
     Ok(())
 }
 
+/// One call on the browser's own DevTools socket (creating and closing tabs).
+fn browser_call(port: u16, path: &str, method: &str, params: Value) -> R<Value> {
+    let (mut reader, mut writer) = ws::connect(&format!("ws://127.0.0.1:{port}{path}")).map_err(|e| e.to_string())?;
+    reader.set_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    writer
+        .send_text(&json!({ "id": 1, "method": method, "params": params }).to_string())
+        .map_err(|e| format!("the browser closed: {e}"))?;
+    loop {
+        let text = reader.recv().map_err(|e| format!("{method}: {e}"))?;
+        let Ok(msg) = serde_json::from_str::<Value>(&text) else { continue };
+        if msg["id"] == 1 {
+            return match msg.get("error") {
+                Some(e) => Err(format!("{method} failed: {}", e["message"].as_str().unwrap_or("error"))),
+                None => Ok(msg["result"].clone()),
+            };
+        }
+    }
+}
+
+/// A tab and its own DevTools socket.
+#[derive(Clone)]
+struct Tab {
+    id: u32,
+    target: String,
+    writer: Arc<Mutex<ws::Writer>>,
+    pending: Pending,
+    s: Arc<Shared>,
+    /// Set before quietbrowser closes the tab itself, so its socket closing is expected.
+    closing: Arc<AtomicBool>,
+}
+
+pub struct Chrome {
+    port: u16,
+    browser_path: String,
+    next_id: Arc<AtomicU64>,
+    tabs: Arc<Mutex<Vec<Tab>>>,
+    current: AtomicU32,
+    next_tab: AtomicU32,
+    closing: Arc<AtomicBool>,
+}
+
 impl Chrome {
     pub fn start() -> R<Chrome> {
         let profile = crate::data_dir().join("chrome-profile");
@@ -228,34 +260,50 @@ impl Chrome {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let page = loop {
+        let target = loop {
             let list: Value = serde_json::from_str(&http_get(port, "/json/list")?).unwrap_or_default();
             if let Some(p) = list.as_array().and_then(|a| a.iter().find(|t| t["type"] == "page").cloned()) {
-                break p;
+                break p["id"].as_str().unwrap_or("").to_string();
             }
             if start.elapsed() > Duration::from_secs(30) {
                 return Err("the browser opened no page".into());
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let url = page["webSocketDebuggerUrl"].as_str().ok_or("no DevTools socket for the page")?;
-        let main_frame = page["id"].as_str().unwrap_or("").to_string();
-        let (reader, writer) = ws::connect(url).map_err(|e| e.to_string())?;
         let c = Chrome {
-            writer: Arc::new(Mutex::new(writer)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
-            s: Arc::new(Shared::default()),
             port,
-            browser_ws: format!("ws://127.0.0.1:{port}{browser_path}"),
+            browser_path,
+            next_id: Arc::new(AtomicU64::new(1)),
+            tabs: Arc::new(Mutex::new(Vec::new())),
+            current: AtomicU32::new(0),
+            next_tab: AtomicU32::new(1),
+            closing: Arc::new(AtomicBool::new(false)),
         };
-        c.spawn_reader(reader, main_frame);
-        let t = Duration::from_secs(10);
-        c.cdp_call("Page.enable", &json!({}), t)?;
-        c.cdp_call("Page.addScriptToEvaluateOnNewDocument", &json!({ "source": IN_PLACE }), t)?;
-        let _ = c.cdp_call("Page.setDownloadBehavior", &json!({ "behavior": "deny" }), t);
+        let id = c.attach(&target)?;
+        c.current.store(id, Ordering::SeqCst);
         log(&format!("chrome ready on port {port}"));
         Ok(c)
+    }
+
+    /// Connects to a page target and prepares it. Returns the new tab's id.
+    fn attach(&self, target: &str) -> R<u32> {
+        let url = format!("ws://127.0.0.1:{}/devtools/page/{target}", self.port);
+        let (reader, writer) = ws::connect(&url).map_err(|e| e.to_string())?;
+        let tab = Tab {
+            id: self.next_tab.fetch_add(1, Ordering::SeqCst),
+            target: target.to_string(),
+            writer: Arc::new(Mutex::new(writer)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            s: Arc::new(Shared::default()),
+            closing: Arc::new(AtomicBool::new(false)),
+        };
+        self.spawn_reader(reader, tab.clone());
+        self.tabs.lock().unwrap().push(tab.clone());
+        let t = Duration::from_secs(10);
+        self.call_on(&tab, "Page.enable", &json!({}), t)?;
+        self.call_on(&tab, "Page.addScriptToEvaluateOnNewDocument", &json!({ "source": IN_PLACE }), t)?;
+        let _ = self.call_on(&tab, "Page.setDownloadBehavior", &json!({ "behavior": "deny" }), t);
+        Ok(tab.id)
     }
 
     fn send(writer: &Mutex<ws::Writer>, id: u64, method: &str, params: &Value) -> R<()> {
@@ -263,25 +311,60 @@ impl Chrome {
         writer.lock().unwrap().send_text(&msg).map_err(|e| format!("the browser closed: {e}"))
     }
 
-    /// Reads every message from the page socket: answers go to the waiting call, events update the
-    /// shared state. Dialogs are answered right away, even between commands.
-    fn spawn_reader(&self, mut reader: ws::Reader, main_frame: String) {
-        let (pending, s, writer, ids) = (self.pending.clone(), self.s.clone(), self.writer.clone(), self.next_id.clone());
-        let (port, browser_ws) = (self.port, self.browser_ws.clone());
+    fn call_on(&self, tab: &Tab, method: &str, params: &Value, timeout: Duration) -> R<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        tab.pending.lock().unwrap().insert(id, tx);
+        if let Err(e) = Chrome::send(&tab.writer, id, method, params) {
+            tab.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r.map_err(|e| format!("{method} failed: {e}")),
+            Err(_) => {
+                tab.pending.lock().unwrap().remove(&id);
+                Err(format!("the page did not answer {method} within {} s", timeout.as_secs()))
+            }
+        }
+    }
+
+    fn current_tab(&self) -> R<Tab> {
+        let id = self.current.load(Ordering::SeqCst);
+        let tabs = self.tabs.lock().unwrap();
+        tabs.iter().find(|t| t.id == id).cloned().ok_or_else(|| "the tab was closed".to_string())
+    }
+
+    /// Reads every message from a tab's socket: answers go to the waiting call, events update the
+    /// tab's state. Dialogs are answered right away, even between commands.
+    fn spawn_reader(&self, mut reader: ws::Reader, tab: Tab) {
+        let (tabs, ids, closing) = (self.tabs.clone(), self.next_id.clone(), self.closing.clone());
+        let (port, path) = (self.port, self.browser_path.clone());
         std::thread::spawn(move || {
             loop {
                 let text = match reader.recv() {
                     Ok(t) => t,
                     Err(e) => {
-                        // The window was closed. Quit the browser too, so the next command starts fresh.
-                        log(&format!("page socket closed: {e}"));
-                        close_browser(port, browser_ws.trim_start_matches(&format!("ws://127.0.0.1:{port}")));
-                        std::process::exit(0);
+                        log(&format!("tab {} socket closed: {e}", tab.id));
+                        if tab.closing.load(Ordering::SeqCst) || closing.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        // Closed in the browser itself (a headed window, or a crash).
+                        let left = {
+                            let mut t = tabs.lock().unwrap();
+                            t.retain(|x| x.id != tab.id);
+                            t.len()
+                        };
+                        if left == 0 || http_get(port, "/json/version").is_err() {
+                            // The window was closed. Quit the browser too, so the next command starts fresh.
+                            close_browser(port, &path);
+                            std::process::exit(0);
+                        }
+                        return;
                     }
                 };
                 let Ok(msg) = serde_json::from_str::<Value>(&text) else { continue };
                 if let Some(id) = msg["id"].as_u64() {
-                    if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                    if let Some(tx) = tab.pending.lock().unwrap().remove(&id) {
                         let r = match msg.get("error") {
                             Some(e) => Err(e["message"].as_str().unwrap_or("error").to_string()),
                             None => Ok(msg["result"].clone()),
@@ -291,24 +374,27 @@ impl Chrome {
                     continue;
                 }
                 let p = &msg["params"];
+                let s = &tab.s;
                 match msg["method"].as_str().unwrap_or("") {
                     "Page.javascriptDialogOpening" => {
                         let kind = p["type"].as_str().unwrap_or("alert");
                         s.dialog(format!("{kind}: {}", p["message"].as_str().unwrap_or("")));
                         let answer = json!({ "accept": true, "promptText": p["defaultPrompt"].as_str().unwrap_or("") });
                         let id = ids.fetch_add(1, Ordering::SeqCst);
-                        let _ = Chrome::send(&writer, id, "Page.handleJavaScriptDialog", &answer);
+                        let _ = Chrome::send(&tab.writer, id, "Page.handleJavaScriptDialog", &answer);
                     }
-                    "Page.frameStartedLoading" if p["frameId"] == main_frame.as_str() => s.nav_started(),
-                    "Page.frameStoppedLoading" if p["frameId"] == main_frame.as_str() => s.nav_finished(true),
-                    _ => {}
+                    // a page target's id is also the id of its main frame
+                    "Page.frameStartedLoading" if p["frameId"] == tab.target.as_str() => s.nav_started(),
+                    "Page.frameStoppedLoading" if p["frameId"] == tab.target.as_str() => s.nav_finished(true),
+                    m => s.cdp_event(m, p),
                 }
             }
         });
     }
 
     pub fn close(&self) {
-        close_browser(self.port, self.browser_ws.trim_start_matches(&format!("ws://127.0.0.1:{}", self.port)));
+        self.closing.store(true, Ordering::SeqCst);
+        close_browser(self.port, &self.browser_path);
     }
 }
 
@@ -326,25 +412,13 @@ fn close_browser(port: u16, path: &str) {
 }
 
 impl Engine for Chrome {
-    fn shared(&self) -> &Shared {
-        &self.s
+    fn shared(&self) -> Arc<Shared> {
+        self.current_tab().map(|t| t.s).unwrap_or_default()
     }
 
     fn cdp_call(&self, method: &str, params: &Value, timeout: Duration) -> R<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        if let Err(e) = Chrome::send(&self.writer, id, method, params) {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
-        match rx.recv_timeout(timeout) {
-            Ok(r) => r.map_err(|e| format!("{method} failed: {e}")),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(format!("the page did not answer {method} within {} s", timeout.as_secs()))
-            }
-        }
+        let tab = self.current_tab()?;
+        self.call_on(&tab, method, params, timeout)
     }
 
     fn pump(&self, timeout: Duration, done: &mut dyn FnMut() -> bool) -> R<bool> {
@@ -367,7 +441,7 @@ impl Engine for Chrome {
                 let r = self.cdp_call("Page.navigate", &json!({ "url": url }), t)?;
                 if let Some(err) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
                     log(&format!("navigation failed: {err}"));
-                    self.s.nav_finished(false);
+                    self.shared().nav_finished(false);
                 }
                 Ok(())
             }
@@ -382,5 +456,48 @@ impl Engine for Chrome {
             }
             Nav::Reload => self.cdp_call("Page.reload", &json!({}), t).map(|_| ()),
         }
+    }
+
+    fn tabs(&self) -> Vec<u32> {
+        self.tabs.lock().unwrap().iter().map(|t| t.id).collect()
+    }
+
+    fn new_tab(&self) -> R<u32> {
+        // Without a window, a tab of its own window is never hidden (hidden pages are throttled).
+        // With a window, a new window would come to the front, so open a background tab instead.
+        let params = json!({ "url": "about:blank", "newWindow": !headed(), "background": true });
+        let r = browser_call(self.port, &self.browser_path, "Target.createTarget", params)?;
+        let target = r["targetId"].as_str().ok_or("the browser opened no tab")?.to_string();
+        let id = self.attach(&target)?;
+        self.current.store(id, Ordering::SeqCst);
+        Ok(id)
+    }
+
+    fn select_tab(&self, id: u32) -> R<()> {
+        if !self.tabs().contains(&id) {
+            return Err("the tab was closed".into());
+        }
+        self.current.store(id, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn close_tab(&self, id: u32) -> R<()> {
+        let tab = {
+            let mut tabs = self.tabs.lock().unwrap();
+            let Some(i) = tabs.iter().position(|t| t.id == id) else { return Ok(()) };
+            tabs.remove(i)
+        };
+        tab.closing.store(true, Ordering::SeqCst);
+        browser_call(self.port, &self.browser_path, "Target.closeTarget", json!({ "targetId": tab.target }))?;
+        Ok(())
+    }
+
+    fn tab_info(&self, id: u32) -> (String, String) {
+        let Some(target) = self.tabs.lock().unwrap().iter().find(|t| t.id == id).map(|t| t.target.clone()) else {
+            return Default::default();
+        };
+        let list: Value = http_get(self.port, "/json/list").ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let t = list.as_array().and_then(|a| a.iter().find(|t| t["id"] == target.as_str()).cloned()).unwrap_or_default();
+        (t["title"].as_str().unwrap_or("").to_string(), t["url"].as_str().unwrap_or("").to_string())
     }
 }

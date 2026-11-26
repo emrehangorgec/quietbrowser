@@ -6,10 +6,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// The job that closes the browser.
+/// The job that closes the browser, with the tabs of every session.
 pub const QUIT: &str = "__quit";
+pub const DEFAULT_SESSION: &str = "default";
 
 pub struct Job {
+    /// Which agent sent it. Each session has its own tabs.
+    pub session: String,
     pub cmd: String,
     pub args: Vec<String>,
     pub reply: Sender<Result<String, String>>,
@@ -146,11 +149,11 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn run(cmd: &str, args: Vec<String>) -> Result<String, String> {
+fn run(session: &str, cmd: &str, args: Vec<String>) -> Result<String, String> {
     let guard = QUEUE.lock().map_err(|_| "busy".to_string())?;
     let tx = guard.as_ref().ok_or("not ready")?;
     let (reply, rx) = mpsc::channel();
-    tx.send(Job { cmd: cmd.to_string(), args, reply }).map_err(|_| "the browser closed".to_string())?;
+    tx.send(Job { session: session.to_string(), cmd: cmd.to_string(), args, reply }).map_err(|_| "the browser closed".to_string())?;
     if let Some(wake) = WAKE.get() {
         wake();
     }
@@ -167,16 +170,17 @@ fn dispatch(path: &str, q: &[(String, String)], body: &str) -> Result<String, St
                 .as_array()
                 .map(|a| a.iter().map(|x| x.as_str().unwrap_or_default().to_string()).collect())
                 .unwrap_or_default();
-            run(cmd, args)
+            let session = v["session"].as_str().filter(|s| !s.is_empty()).unwrap_or(DEFAULT_SESSION);
+            run(session, cmd, args)
         }
         "/hwnd" => Ok(ID.get().cloned().unwrap_or_default()),
         // Short query-string forms used by the focus test.
-        "/open" => run("open", vec![get("url", "about:blank")]),
-        "/eval" => run("eval", vec![get("js", "null")]),
-        "/click" => run("click", vec![get("sel", "")]),
-        "/fill" => run("fill", vec![get("sel", ""), get("text", "")]),
-        "/dialogs" => run("dialogs", vec![]),
-        "/quit" => run(QUIT, vec![]),
+        "/open" => run(DEFAULT_SESSION, "open", vec![get("url", "about:blank")]),
+        "/eval" => run(DEFAULT_SESSION, "eval", vec![get("js", "null")]),
+        "/click" => run(DEFAULT_SESSION, "click", vec![get("sel", "")]),
+        "/fill" => run(DEFAULT_SESSION, "fill", vec![get("sel", ""), get("text", "")]),
+        "/dialogs" => run(DEFAULT_SESSION, "dialogs", vec![]),
+        "/quit" => run(DEFAULT_SESSION, QUIT, vec![]),
         _ => Err(format!("unknown endpoint {path}")),
     }
 }

@@ -37,10 +37,17 @@ quietbrowser select <ref|selector> <value>...
 quietbrowser text                    visible text of the page
 quietbrowser eval <js>               run JavaScript, print the JSON result
 quietbrowser back | reload
+quietbrowser wait <text|seconds>     wait for text to show up (--gone: to disappear)
+quietbrowser console [all|errors]    console messages and uncaught errors
+quietbrowser network [all|failed]    requests with their status
+quietbrowser tabs                    list tabs
+quietbrowser tab new [url] | tab select <i> | tab close [i]
 quietbrowser dialogs                 dialogs answered so far
 quietbrowser screenshot [file.png]   save a screenshot, print the path
+quietbrowser record start | record stop [file.png]
 quietbrowser media dark|light|reset  emulate the color scheme
-quietbrowser start | quit
+quietbrowser login <url>             show a page to you, to log in by hand
+quietbrowser start | quit [--all]
 quietbrowser install-skill           install the agent skill for Claude Code
 quietbrowser mcp                     run as an MCP server over stdio
 ```
@@ -65,6 +72,39 @@ After an action you get only what changed, which keeps agent context small:
 - - textbox "Email" [ref=e2]
 ```
 
+## Debugging your own app
+
+When an agent checks the web app it is working on, the first question is usually what broke. An action that logs an error says so right away:
+
+```
+> quietbrowser click e4
+### Changes
++ - alert "Saved"
+### Console errors
+[error] Uncaught TypeError: user.name is undefined (profile.js:42)
+```
+
+`console` lists everything the page logged since it loaded, and `network failed` lists the requests that failed or answered 4xx or 5xx:
+
+```
+> quietbrowser network failed
+POST 500 http://localhost:3000/api/profile (fetch)
+GET failed net::ERR_CONNECTION_REFUSED http://localhost:4000/avatar.png (image)
+```
+
+`record start` and `record stop demo.png` save every step in between as an animated PNG, which plays in browsers and on GitHub, so an agent can show a change in a pull request.
+
+## Several agents at once
+
+Agents that work at the same time each get tabs of their own in the same browser, so they do not click around in each other's pages but share your logins. Over MCP this happens by itself. On the command line, each agent passes its own name:
+
+```
+quietbrowser --session frontend open localhost:3000
+quietbrowser --session docs open localhost:8000
+```
+
+(or sets `QUIETBROWSER_SESSION`). `quit` closes the session's tabs, and the browser closes with the last one.
+
 ## Install
 
 With Node.js, one line adds it to your agent as an MCP server:
@@ -74,7 +114,7 @@ claude mcp add quietbrowser -- npx -y quietbrowser mcp
 codex mcp add quietbrowser -- npx -y quietbrowser mcp
 ```
 
-The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...), so agents already know how to use them. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
+The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_tabs`, `browser_console_messages`, ...), so agents already know how to use them. Two are extra: `browser_record` and `browser_login`. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
 
 The package runs on Windows (x64), macOS (Intel and Apple Silicon) and Linux (x64). On macOS and Linux it needs Chrome, Edge, Brave or Chromium installed.
 
@@ -108,10 +148,10 @@ Other agents can read [`skill/SKILL.md`](skill/SKILL.md) directly.
 ## How it works
 
 * The window is shown with `WS_EX_NOACTIVATE` and never calls `SetForegroundWindow`. A click by you activates it like a normal window, and it goes quiet again when you switch away.
-* `alert`, `confirm` and `prompt` are answered in code, popups open in the same window and downloads are blocked, so no dialog appears.
+* `alert`, `confirm` and `prompt` are answered in code, popups open in the same tab and downloads are blocked, so no dialog appears. Tabs the agent opens are created in the background.
 * Snapshots come from the Chrome DevTools Protocol accessibility tree. Clicks and typing are sent as input events, so pages see a real user gesture.
 * On macOS and Linux, Chrome is started with its own profile and driven over the same protocol through a WebSocket. Without `QUIETBROWSER_HEADED=1` it runs headless.
-* One small executable (about 0.5 MB, written in Rust). `quietbrowser serve` runs the window; every other command is a client that starts it when needed and talks to it over a local HTTP port (`QUIETBROWSER_PORT`, default 9555).
+* One small executable (under 1 MB, written in Rust). `quietbrowser serve` runs the window; every other command is a client that starts it when needed and talks to it over a local HTTP port (`QUIETBROWSER_PORT`, default 9555). Each command carries its session, and the server keeps a list of tabs per session.
 
 ## Build
 
@@ -135,9 +175,9 @@ If the browser is not found, point `QUIETBROWSER_CHROME` at it. `python test/smo
 
 ## Status
 
-Early. The exe is not code signed yet, so a browser download may show a SmartScreen warning once. Not done yet: several agents in separate workspaces, a DevTools endpoint for Playwright, and packages for winget and Scoop.
+Early. The exe is not code signed yet, so a browser download may show a SmartScreen warning once. Not done yet: a DevTools endpoint for Playwright, and packages for winget and Scoop.
 
-Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile` on Windows, `~/Library/Application Support/quietbrowser` on macOS and `~/.local/share/quietbrowser` on Linux. If a site needs a login or a CAPTCHA, the skill tells the agent to ask you to do it in the window. On macOS and Linux, run once with `QUIETBROWSER_HEADED=1` to get a window for that.
+Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile` on Windows, `~/Library/Application Support/quietbrowser` on macOS and `~/.local/share/quietbrowser` on Linux. If a site needs a login or a CAPTCHA, the agent runs `login <url>` and asks you to do it. On Windows the window shows the page and its taskbar button flashes, without taking focus. On macOS and Linux Chrome restarts with a window; log in, close the window, and it runs without one again.
 
 ## License
 

@@ -2,9 +2,11 @@
 
 Usage: python test/smoke.py path/to/quietbrowser [--engine chrome|webview2]
 Uses port 9577 so it does not touch a browser you already have open.
-On macOS it also checks after every command that the browser never became the front app.
+After every command it checks that the browser did not take focus: on macOS the front app must
+not be a browser, on Windows the foreground window must not belong to quietbrowser or Chrome.
 """
 
+import json
 import os
 import pathlib
 import subprocess
@@ -19,6 +21,11 @@ PAGE = """<!doctype html><title>Smoke home</title>
 <select id="color" aria-label="Color"><option>red</option><option>green</option></select>
 <button onclick="alert('hi there')">Alert</button>
 <a href="two.html">Second page</a>
+<button id="fail" onclick="console.error('smoke broke')">Fail</button>
+<button id="later" onclick="setTimeout(()=>{document.getElementById('slow').textContent='later done'},800)">Later</button>
+<p id="slow">not yet</p>
+<img src="missing.png" alt="">
+<script>console.log('smoke loaded')</script>
 """
 TWO = "<!doctype html><title>Smoke two</title><h1>Second page</h1><p>arrived</p>"
 
@@ -32,12 +39,37 @@ def front_app():
     return info.split("=", 1)[-1].strip().strip('"') or "?"
 
 
+def foreground_program():
+    """File name of the program that owns the foreground window on Windows, None elsewhere."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return "(none)"
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return "?"
+    buf = ctypes.create_unicode_buffer(1024)
+    size = wintypes.DWORD(1024)
+    kernel32.QueryFullProcessImageNameW(process, 0, buf, ctypes.byref(size))
+    kernel32.CloseHandle(process)
+    return os.path.basename(buf.value).lower()
+
+
 BROWSER_NAMES = ("chrome", "chromium", "edge", "brave")
+BROWSER_PROGRAMS = ("quietbrowser.exe", "msedgewebview2.exe", "chrome.exe", "msedge.exe")
 
 
 def main():
     exe = os.path.abspath(sys.argv[1])
     env = dict(os.environ, QUIETBROWSER_PORT="9577")
+    env.pop("QUIETBROWSER_SESSION", None)
     if "--engine" in sys.argv:
         env["QUIETBROWSER_ENGINE"] = sys.argv[sys.argv.index("--engine") + 1]
 
@@ -46,27 +78,41 @@ def main():
     (site / "index.html").write_text(PAGE, encoding="utf-8")
     (site / "two.html").write_text(TWO, encoding="utf-8")
     base = (site / "index.html").as_uri()
+    two = (site / "two.html").as_uri()
 
     failures = 0
 
-    def run(*args, expect=None, timeout=90):
+    def run(*args, expect=None, absent=None, code=0, timeout=90):
         nonlocal failures
         p = subprocess.run([exe, *args], env=env, capture_output=True, text=True, timeout=timeout)
         out = p.stdout + p.stderr
-        ok = p.returncode == 0 and (expect is None or expect in out)
+        ok = p.returncode == code and (expect is None or expect in out) and (absent is None or absent not in out)
         front = front_app()
         if front and any(n in front.lower() for n in BROWSER_NAMES):
             ok = False
             out += f"\nthe browser took focus: front app is {front}"
+        fg = foreground_program()
+        if fg in BROWSER_PROGRAMS:
+            ok = False
+            out += f"\nthe browser took focus: the foreground window belongs to {fg}"
         print(("ok   " if ok else "FAIL ") + " ".join(args) + (f"  [front: {front}]" if front else ""))
         if not ok:
             failures += 1
-            print("     exit", p.returncode, "expected", repr(expect))
+            print("     exit", p.returncode, "expected", repr(expect), "absent", repr(absent))
             print("     " + out.strip().replace("\n", "\n     "))
         return out
 
+    def check(name, ok, detail=""):
+        nonlocal failures
+        print(("ok   " if ok else "FAIL ") + name)
+        if not ok:
+            failures += 1
+            print("     " + detail)
+
     if sys.platform == "darwin":
         print("front app before:", front_app())
+    if sys.platform == "win32":
+        print("foreground before:", foreground_program())
     try:
         run("open", base, expect="Smoke test", timeout=120)
         run("fill", "#name", "Ada", expect=None)
@@ -77,10 +123,67 @@ def main():
         run("click", "button:nth-of-type(2)")
         run("dialogs", expect="hi there")
         run("text", expect="Smoke test")
+
+        # console and network
+        run("console", expect="smoke loaded")
+        run("network", expect="missing.png")
+        run("network", "failed", expect="missing.png", absent="index.html")
+        run("click", "#fail", expect="smoke broke")
+        run("console", "errors", expect="smoke broke", absent="smoke loaded")
+
+        # wait
+        run("click", "#later")
+        run("wait", "later done", expect="Found: later done")
+        run("wait", "later done", "--gone", "--timeout", "1", expect="still there", code=1)
+        run("wait", "0.2")
+
+        # recording
+        rec = site / "rec.png"
+        run("record", "start", expect="Recording")
+        run("fill", "#name", "Grace")
+        run("click", "#go", expect="Hello Grace")
+        run("record", "stop", str(rec), expect="frames")
+        data = rec.read_bytes() if rec.exists() else b""
+        check("record is an animated PNG", data.startswith(b"\x89PNG") and b"acTL" in data and b"fdAT" in data,
+              f"{len(data)} bytes")
+
+        # tabs
+        run("tab", "new", two, expect="Second page")
+        run("tabs", expect="(current) [Smoke two]")
+        run("tab", "select", "0", expect="Smoke home")
+        run("eval", "document.title", expect='"Smoke home"')
+        run("tab", "close", "1", expect="Open tabs")
+        run("tabs", absent="Smoke two")
+
+        # sessions: another agent gets its own tab, and this one keeps its page
+        run("--session", "other", "open", two, expect="Second page")
+        run("eval", "document.title", expect='"Smoke home"')
+        run("--session", "other", "eval", "document.title", expect='"Smoke two"')
+        run("--session", "other", "quit")
+        run("eval", "document.title", expect='"Smoke home"')
+
         run("click", "a", expect="arrived")
+        run("network", expect="two.html", absent="index.html")
         run("back", expect="Smoke home")
         run("press", "Tab")
         run("screenshot", expect=None)
+
+        # the MCP server lists the new tools
+        msgs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        ]
+        p = subprocess.run([exe, "mcp"], env=env, input="\n".join(json.dumps(m) for m in msgs) + "\n",
+                           capture_output=True, text=True, timeout=60)
+        names = []
+        for line in p.stdout.splitlines():
+            msg = json.loads(line)
+            if msg.get("id") == 2:
+                names = [t["name"] for t in msg["result"]["tools"]]
+        wanted = ["browser_console_messages", "browser_network_requests", "browser_tabs", "browser_record", "browser_login"]
+        check("mcp tools/list", all(n in names for n in wanted), f"tools: {names}")
+        # the MCP server closed its (unused) session on exit; this session must still be there
+        run("eval", "document.title", expect='"Smoke home"')
     finally:
         run("quit")
 

@@ -65,6 +65,10 @@ impl Writer {
 }
 
 impl Reader {
+    pub fn set_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_read_timeout(t)
+    }
+
     /// The next complete text or binary message. Fails when the connection closes.
     pub fn recv(&mut self) -> io::Result<String> {
         let mut message = Vec::new();

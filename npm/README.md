@@ -8,7 +8,7 @@ On Windows, a real browser window (Microsoft Edge WebView2) that opens behind wh
 
 ## MCP
 
-The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, ...).
+The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_tabs`, `browser_console_messages`, ...). Agents that run at the same time each get their own tabs in the same browser.
 
 ```
 claude mcp add quietbrowser -- npx -y quietbrowser mcp

@@ -3,6 +3,7 @@
 // client that sends one command to it and prints the answer, starting the browser first if needed.
 // Windows uses its own WebView2 window; macOS and Linux use the installed Chrome over CDP.
 mod agent;
+mod apng;
 #[cfg(windows)]
 mod browser;
 mod chrome;
@@ -14,12 +15,13 @@ mod ws;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 quietbrowser: a browser for coding agents that never steals focus
 
-Usage: quietbrowser <command> [args]
+Usage: quietbrowser [--session <name>] <command> [args]
 
   open <url>             Open a page, print a snapshot
   snapshot               Print the page as an accessibility tree with [ref=eN] handles
@@ -34,14 +36,28 @@ Usage: quietbrowser <command> [args]
   text                   Print the page's visible text
   eval <js>              Run JavaScript, print the JSON result
   back | reload          Navigate back or reload
+  wait <text|seconds>    Wait until the text shows up (--gone: until it disappears),
+                         or for some seconds, print what changed (--timeout N, default 30)
+  console [all|errors]   Console messages and uncaught errors since the page loaded
+  network [all|failed]   Requests since the page loaded, with their status
+  tabs                   List this session's tabs
+  tab new [url] | tab select <i> | tab close [i]
+                         Open, switch to or close a tab (in the background)
   dialogs                List alert/confirm/prompt dialogs answered so far
   screenshot [file.png]  Save a screenshot of the page, print the file path
+  record start | record stop [file.png]
+                         Record every command as a frame of an animated PNG
   media dark|light|reset Emulate the page's color scheme
-  start | quit           Start or close the browser window
+  login <url>            Open a page for the user to log in by hand
+  start | quit           Start the browser, or close this session's tabs
+                         (the browser closes with the last session; quit --all closes it now)
   install-skill          Install the agent skill for Claude Code (~/.claude/skills/quietbrowser)
   mcp                    Run as an MCP server over stdio (Playwright MCP tool names)
 
 The window shows up without taking focus. Click it to use it yourself.
+Sessions: agents working at the same time each pass their own --session name (or set
+QUIETBROWSER_SESSION) and get their own tabs in the same browser, logins included.
+The MCP server gives each agent a session of its own.
 Port: QUIETBROWSER_PORT (default 9555).
 Engine: QUIETBROWSER_ENGINE=webview2 (Windows default) or chrome (macOS and Linux).
 Browser for the chrome engine: QUIETBROWSER_CHROME (found automatically if unset).";
@@ -139,12 +155,36 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+static SESSION: OnceLock<String> = OnceLock::new();
+
+pub fn set_session(name: String) {
+    let _ = SESSION.set(name);
+}
+
+/// The session this process speaks for: --session, then QUIETBROWSER_SESSION, then the default.
+fn session() -> String {
+    SESSION
+        .get()
+        .cloned()
+        .or_else(|| std::env::var("QUIETBROWSER_SESSION").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| server::DEFAULT_SESSION.to_string())
+}
+
 fn port() -> u16 {
     std::env::var("QUIETBROWSER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9555)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--session") {
+        let Some(name) = args.get(1).cloned() else {
+            eprintln!("error: --session needs a name");
+            std::process::exit(2);
+        };
+        set_session(name);
+        args.drain(..2);
+    }
     let code = match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
@@ -210,18 +250,25 @@ fn serve_chrome(port: u16) -> Result<(), String> {
     if let Err(e) = agent::init(&c) {
         log(&format!("init failed: {e}"));
     }
-    server::start(port, "0".into(), Box::new(|| {})).map_err(|e| format!("port {port}: {e}"))?;
-    log(&format!("serving on {port} (chrome)"));
+    let id = if chrome::headed() { "chrome-headed" } else { "chrome" };
+    server::start(port, id.into(), Box::new(|| {})).map_err(|e| format!("port {port}: {e}"))?;
+    log(&format!("serving on {port} ({id})"));
     loop {
         let Some(job) = server::wait_job(Duration::from_secs(3600)) else { continue };
-        if job.cmd == server::QUIT {
+        let result = if job.cmd == server::QUIT {
+            agent::exit_requested();
+            Ok("bye".into())
+        } else {
+            agent::dispatch(&c, &job.session, &job.cmd, &job.args)
+        };
+        if agent::should_exit() {
             // close first, so the next command never reaches this server while it shuts down
             c.close();
-            let _ = job.reply.send(Ok("bye".into()));
+            let _ = job.reply.send(result);
             std::thread::sleep(Duration::from_millis(200));
             return Ok(());
         }
-        let _ = job.reply.send(agent::run(&c, &job.cmd, &job.args));
+        let _ = job.reply.send(result);
     }
 }
 
@@ -265,8 +312,13 @@ fn request(method: &str, path: &str, body: &str, timeout: Duration) -> std::io::
     Ok((code, body.to_string()))
 }
 
+/// What the running server reports about itself (its window handle, or the Chrome mode), if one runs.
+fn server_id() -> Option<String> {
+    request("GET", "/hwnd", "", Duration::from_secs(5)).ok().filter(|(c, _)| *c == 200).map(|(_, id)| id)
+}
+
 fn running() -> bool {
-    request("GET", "/hwnd", "", Duration::from_secs(5)).map(|(c, _)| c == 200).unwrap_or(false)
+    server_id().is_some()
 }
 
 /// Starts `quietbrowser serve` detached and without inherited handles. An inherited stdout handle
@@ -348,22 +400,96 @@ fn ensure_running() -> Result<(), String> {
 
 /// Runs one command in the browser window, starting it if needed. Used by the CLI and the MCP server.
 pub fn call(cmd: &str, args: &[String]) -> Result<String, String> {
-    if cmd == "quit" {
-        if running() {
-            let _ = request("GET", "/quit", "", Duration::from_secs(20));
+    match cmd {
+        "quit" => {
+            if running() {
+                if args.first().is_some_and(|a| a == "--all") {
+                    let _ = request("GET", "/quit", "", Duration::from_secs(20));
+                } else {
+                    let body = serde_json::json!({ "cmd": "quit", "args": [], "session": session() }).to_string();
+                    let _ = request("POST", "/run", &body, Duration::from_secs(20));
+                }
+            }
+            return Ok("closed".into());
         }
-        return Ok("closed".into());
+        "wait" => return wait(args),
+        "login" => return login(args),
+        _ => {}
     }
     ensure_running()?;
     if cmd == "start" {
         return Ok("running".into());
     }
-    let body = serde_json::json!({ "cmd": cmd, "args": args }).to_string();
+    let body = serde_json::json!({ "cmd": cmd, "args": args, "session": session() }).to_string();
     let (code, text) = request("POST", "/run", &body, Duration::from_secs(120)).map_err(|e| e.to_string())?;
     if code != 200 {
         return Err(text);
     }
     Ok(text)
+}
+
+/// `wait <text> [--gone] [--timeout N]` or `wait <seconds>`. Polls from here, one short command at
+/// a time, so agents in other sessions are not held up while this one waits.
+pub fn wait(args: &[String]) -> Result<String, String> {
+    let (mut text, mut gone, mut timeout) = (None, false, 30.0f64);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--gone" => gone = true,
+            "--timeout" => {
+                timeout = it.next().and_then(|t| t.parse().ok()).ok_or("wait: --timeout needs seconds")?;
+            }
+            _ => text = Some(a.clone()),
+        }
+    }
+    let text = text.ok_or("wait: missing text or seconds")?;
+    if !gone {
+        if let Ok(secs) = text.parse::<f64>() {
+            std::thread::sleep(Duration::from_secs_f64(secs.clamp(0.0, 120.0)));
+            return call("__changes", &[]);
+        }
+    }
+    let start = Instant::now();
+    let mode = if gone { "gone" } else { "present" };
+    loop {
+        if call("__has_text", &[text.clone(), mode.into()])? == "yes" {
+            let changes = call("__changes", &[])?;
+            let what = if gone { "Gone" } else { "Found" };
+            return Ok(format!("{what}: {text}\n{changes}"));
+        }
+        if start.elapsed().as_secs_f64() > timeout {
+            let what = if gone { "still there" } else { "did not show up" };
+            return Err(format!("wait: \"{text}\" {what} after {timeout} s"));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// `login <url>`: shows the page to the user so they can log in by hand. The profile keeps the login.
+/// Headless Chrome has no window, so it is restarted with one until the user closes it.
+fn login(args: &[String]) -> Result<String, String> {
+    let url = args.first().ok_or("login: missing url")?;
+    let chrome = use_chrome(&[]);
+    if chrome && server_id().as_deref() != Some("chrome-headed") {
+        if running() {
+            let _ = request("GET", "/quit", "", Duration::from_secs(20));
+        }
+        // inherited by the server started next
+        unsafe { std::env::set_var("QUIETBROWSER_HEADED", "1") };
+    }
+    let page = call("open", std::slice::from_ref(url))?;
+    let _ = call("__attention", &[]);
+    let head: Vec<&str> = page.lines().take(2).collect();
+    let note = if chrome {
+        "A browser window is open on this page (it may be behind other windows). Ask the user to log \
+         in there and close the window when they are done. quietbrowser then runs without a window \
+         again, and keeps the login."
+    } else {
+        "The quietbrowser window shows this page behind the user's other windows, and its taskbar \
+         button is flashing. Ask the user to click it, log in, and tell you when they are done. The \
+         login is kept for later runs."
+    };
+    Ok(format!("{}\n{note}", head.join("\n")))
 }
 
 fn client(cmd: &str, args: &[String]) -> Result<i32, String> {
