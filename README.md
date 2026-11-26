@@ -1,18 +1,31 @@
 # quietbrowser
 
-**A browser for coding agents that never steals your focus.**
+**One browser for all your coding agents.** Each agent gets its own tabs, they share your logins, and none of them ever steals your focus.
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Screen recording: text is typed into a focused editor while an agent opens a sign up page in quietbrowser behind it, fills the email, ticks the box and submits. The focus line stays on the editor with 0 focus steals." width="900">
+  <img src="docs/demo.gif" alt="Screen recording: three agents drive one quietbrowser window at the same time, each in a tab named after it. One fills a sign up form, one switches a pricing page to yearly, one finds a failing request on a docs page. Meanwhile text is typed into a focused editor, and the focus line stays on the editor with 0 focus steals." width="900">
 </p>
 
-When Claude Code, Codex or another agent opens a browser, the window jumps in front of you and your next keystrokes land in the wrong place. On Windows, quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agent drives it from the command line while you keep typing. Click the window when you want to use it yourself.
+Run Claude Code, Codex and a few more agents side by side, and each one opens a browser of its own: a stack of windows, logins that only exist in one of them, and every window jumping in front of you while you type. quietbrowser is one browser they all share. Each agent works in tabs of its own, so they never click around in each other's pages. Logins are shared, so you sign in once. And the window never takes your keyboard focus.
 
-On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Set `QUIETBROWSER_HEADED=1` to see the window, for example to log in once; Chrome then comes to the front when it starts.
+## Several agents, one browser
 
-## Measured
+Over MCP every agent gets its own session by itself, named after the client (`claude-code 4312`). On the command line, each agent passes its own name:
 
-On Windows. A test window stays in front while the browser is started and driven in the background. It records every moment another window becomes the foreground window and counts typed keys that never arrive. The test pages try hard to grab focus: `autofocus`, `window.focus()` every 50 ms, `alert`/`confirm`/`prompt`, `window.open`.
+```
+quietbrowser --session frontend open localhost:3000
+quietbrowser --session docs open localhost:8000
+```
+
+(or sets `QUIETBROWSER_SESSION`). On Windows the window has a tab strip: each tab shows the agent that owns it in its own color, and `working` while a command runs in it. Click a tab to look at it; the agents keep working in theirs. `quit` closes the session's tabs, and the browser closes with the last one.
+
+## Never steals focus
+
+On Windows, quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agents drive it from the command line or over MCP while you keep typing. Click the window when you want to use it yourself.
+
+On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Sessions work the same way. Set `QUIETBROWSER_HEADED=1` to see the window, for example to log in once; Chrome then comes to the front when it starts.
+
+Measured on Windows. A test window stays in front while the browser is started and driven in the background. It records every moment another window becomes the foreground window and counts typed keys that never arrive. The test pages try hard to grab focus: `autofocus`, `window.focus()` every 50 ms, `alert`/`confirm`/`prompt`, `window.open`.
 
 | Run | Commands | Focus taken | Keys lost |
 |---|---|---|---|
@@ -22,6 +35,29 @@ On Windows. A test window stays in front while the browser is started and driven
 | **quietbrowser while typing** | **120** | **0** | **0 of 871** |
 
 Windows already blocks focus changes while you are typing, so most focus theft happens when you are idle: reading, or waiting for the agent. The idle runs are the ones that matter. Run it yourself with `test/FocusTest`.
+
+## Debugging your own app
+
+
+When an agent checks the web app it is working on, the first question is usually what broke. An action that logs an error says so right away:
+
+```
+> quietbrowser click e4
+### Changes
++ - alert "Saved"
+### Console errors
+[error] Uncaught TypeError: user.name is undefined (profile.js:42)
+```
+
+`console` lists everything the page logged since it loaded, and `network failed` lists the requests that failed or answered 4xx or 5xx:
+
+```
+> quietbrowser network failed
+POST 500 http://localhost:3000/api/profile (fetch)
+GET failed net::ERR_CONNECTION_REFUSED http://localhost:4000/avatar.png (image)
+```
+
+`record start` and `record stop demo.png` save every step in between as an animated PNG, which plays in browsers and on GitHub, so an agent can show a change in a pull request.
 
 ## Commands
 
@@ -71,39 +107,6 @@ After an action you get only what changed, which keeps agent context small:
 + - textbox "Email" [ref=e2]: dev@example.com
 - - textbox "Email" [ref=e2]
 ```
-
-## Debugging your own app
-
-When an agent checks the web app it is working on, the first question is usually what broke. An action that logs an error says so right away:
-
-```
-> quietbrowser click e4
-### Changes
-+ - alert "Saved"
-### Console errors
-[error] Uncaught TypeError: user.name is undefined (profile.js:42)
-```
-
-`console` lists everything the page logged since it loaded, and `network failed` lists the requests that failed or answered 4xx or 5xx:
-
-```
-> quietbrowser network failed
-POST 500 http://localhost:3000/api/profile (fetch)
-GET failed net::ERR_CONNECTION_REFUSED http://localhost:4000/avatar.png (image)
-```
-
-`record start` and `record stop demo.png` save every step in between as an animated PNG, which plays in browsers and on GitHub, so an agent can show a change in a pull request.
-
-## Several agents at once
-
-Agents that work at the same time each get tabs of their own in the same browser, so they do not click around in each other's pages but share your logins. Over MCP this happens by itself. On the command line, each agent passes its own name:
-
-```
-quietbrowser --session frontend open localhost:3000
-quietbrowser --session docs open localhost:8000
-```
-
-(or sets `QUIETBROWSER_SESSION`). `quit` closes the session's tabs, and the browser closes with the last one.
 
 ## Install
 

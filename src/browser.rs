@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler, NavigationCompletedEventHandler, ScriptDialogOpeningEventHandler, NewWindowRequestedEventHandler, DownloadStartingEventHandler, DevToolsProtocolEventReceivedEventHandler};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::UpdateWindow;
+use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::GdiPlus as gp;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -33,6 +35,183 @@ pub struct Browser {
     tabs: RefCell<Vec<Tab>>,
     current: Cell<u32>,
     next_tab: Cell<u32>,
+    /// Which agent each tab belongs to, shown in the tab strip.
+    labels: RefCell<std::collections::HashMap<u32, String>>,
+    /// The tab a command is running in (0 when idle).
+    busy: Cell<u32>,
+    /// When the busy tab goes back to idle; it stays marked a moment so a short command is seen.
+    idle_at: Cell<Option<Instant>>,
+    /// Spinner step, advanced by a timer while a tab is busy.
+    spin: Cell<u32>,
+    /// Agents in the order they first showed up, for their colors.
+    agents: RefCell<Vec<String>>,
+}
+
+/// One color per agent, in the order they show up.
+const AGENT_COLORS: [(u8, u8, u8); 6] =
+    [(96, 165, 250), (251, 146, 60), (167, 139, 250), (45, 212, 191), (244, 114, 182), (163, 230, 53)];
+const STRIP_BG: (u8, u8, u8) = (24, 25, 29);
+const TAB_BG: (u8, u8, u8) = (34, 35, 41);
+const TAB_SELECTED: (u8, u8, u8) = (50, 52, 61);
+const TAB_BORDER: (u8, u8, u8) = (72, 75, 86);
+const WORKING: (u8, u8, u8) = (74, 222, 128);
+
+/// Height of the tab strip above the page, in pixels at 96 DPI.
+const STRIP: i32 = 40;
+const TAB_WIDTH: i32 = 250;
+/// Timer that turns the spinner while a tab is busy.
+const SPIN_TIMER: usize = 1;
+
+fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
+}
+
+fn rgb3((r, g, b): (u8, u8, u8)) -> COLORREF {
+    rgb(r, g, b)
+}
+
+/// A GDI+ color.
+fn argb(a: u8, (r, g, b): (u8, u8, u8)) -> u32 {
+    (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+/// The color mixed with white, for text on the dark strip.
+fn lighten((r, g, b): (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let m = |c: u8| (c as f32 + (255.0 - c as f32) * t) as u8;
+    (m(r), m(g), m(b))
+}
+
+/// Anti-aliased shapes for the strip, drawn with GDI+ on a memory DC.
+struct Canvas(*mut gp::GpGraphics);
+
+impl Canvas {
+    unsafe fn new(hdc: HDC) -> Canvas {
+        let mut g = std::ptr::null_mut();
+        unsafe {
+            gp::GdipCreateFromHDC(hdc, &mut g);
+            gp::GdipSetSmoothingMode(g, gp::SmoothingModeAntiAlias);
+            gp::GdipSetPixelOffsetMode(g, gp::PixelOffsetModeHalf);
+        }
+        Canvas(g)
+    }
+
+    fn round_rect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, fill: u32, border: Option<u32>) {
+        unsafe {
+            let mut path = std::ptr::null_mut();
+            gp::GdipCreatePath(gp::FillModeAlternate, &mut path);
+            let d = r * 2.0;
+            gp::GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+            gp::GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
+            gp::GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
+            gp::GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
+            gp::GdipClosePathFigure(path);
+            let mut brush = std::ptr::null_mut();
+            gp::GdipCreateSolidFill(fill, &mut brush);
+            gp::GdipFillPath(self.0, brush as *mut gp::GpBrush, path);
+            gp::GdipDeleteBrush(brush as *mut gp::GpBrush);
+            if let Some(color) = border {
+                let mut pen = std::ptr::null_mut();
+                gp::GdipCreatePen1(color, 1.0, gp::UnitPixel, &mut pen);
+                gp::GdipDrawPath(self.0, pen, path);
+                gp::GdipDeletePen(pen);
+            }
+            gp::GdipDeletePath(path);
+        }
+    }
+
+    fn dot(&self, cx: f32, cy: f32, d: f32, color: u32) {
+        unsafe {
+            let mut brush = std::ptr::null_mut();
+            gp::GdipCreateSolidFill(color, &mut brush);
+            gp::GdipFillEllipse(self.0, brush as *mut gp::GpBrush, cx - d / 2.0, cy - d / 2.0, d, d);
+            gp::GdipDeleteBrush(brush as *mut gp::GpBrush);
+        }
+    }
+
+    fn arc(&self, cx: f32, cy: f32, d: f32, width: f32, start: f32, sweep: f32, color: u32) {
+        unsafe {
+            let mut pen = std::ptr::null_mut();
+            gp::GdipCreatePen1(color, width, gp::UnitPixel, &mut pen);
+            gp::GdipSetPenStartCap(pen, gp::LineCapRound);
+            gp::GdipSetPenEndCap(pen, gp::LineCapRound);
+            gp::GdipDrawArc(self.0, pen, cx - d / 2.0, cy - d / 2.0, d, d, start, sweep);
+            gp::GdipDeletePen(pen);
+        }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            gp::GdipDeleteGraphics(self.0);
+        }
+    }
+}
+
+/// The app icon, drawn here so the exe needs no resource file: a dark rounded window with
+/// three dots in the first agent colors over a page, for several agents sharing one browser.
+fn app_icon(size: i32) -> Option<HICON> {
+    const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x26200A;
+    let f = size as f32;
+    unsafe {
+        let mut bmp = std::ptr::null_mut();
+        if gp::GdipCreateBitmapFromScan0(size, size, 0, PIXEL_FORMAT_32BPP_ARGB, None, &mut bmp) != gp::Ok {
+            return None;
+        }
+        let mut g = std::ptr::null_mut();
+        gp::GdipGetImageGraphicsContext(bmp as *mut gp::GpImage, &mut g);
+        gp::GdipSetSmoothingMode(g, gp::SmoothingModeAntiAlias);
+        gp::GdipSetPixelOffsetMode(g, gp::PixelOffsetModeHalf);
+        gp::GdipGraphicsClear(g, 0);
+        {
+            let c = Canvas(g);
+            c.round_rect(0.5, 0.5, f - 1.0, f - 1.0, f * 0.24, argb(255, STRIP_BG), Some(argb(255, TAB_BORDER)));
+            c.round_rect(f * 0.16, f * 0.58, f * 0.68, f * 0.24, f * 0.07, argb(255, TAB_SELECTED), None);
+            for (i, &color) in AGENT_COLORS[..3].iter().enumerate() {
+                c.dot(f * (0.27 + 0.23 * i as f32), f * 0.35, f * 0.21, argb(255, color));
+            }
+        }
+        let mut icon = HICON::default();
+        let ok = gp::GdipCreateHICONFromBitmap(bmp, &mut icon) == gp::Ok;
+        gp::GdipDisposeImage(bmp as *mut gp::GpImage);
+        ok.then_some(icon)
+    }
+}
+
+fn set_icons(hwnd: HWND) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    for (kind, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+        let size = unsafe { GetSystemMetricsForDpi(metric, dpi) };
+        if let Some(icon) = app_icon(size) {
+            unsafe {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
+            }
+        }
+    }
+}
+
+/// Starts GDI+ once for the process.
+fn start_gdiplus() {
+    let input = gp::GdiplusStartupInput { GdiplusVersion: 1, ..Default::default() };
+    let mut token = 0usize;
+    unsafe {
+        gp::GdiplusStartup(&mut token, &input, std::ptr::null_mut());
+    }
+}
+
+/// A dark title bar that matches the strip (Windows 10 20H1 and later; the caption color needs Windows 11).
+fn dark_title_bar(hwnd: HWND) {
+    let on: BOOL = true.into();
+    let caption = rgb3(STRIP_BG);
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const _ as _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption as *const _ as _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &caption as *const _ as _, 4);
+    }
+}
+
+fn scale(hwnd: HWND, v: i32) -> i32 {
+    v * unsafe { GetDpiForWindow(hwnd) }.max(96) as i32 / 96
 }
 
 impl Browser {
@@ -45,7 +224,165 @@ impl Browser {
         let mut r = RECT::default();
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut r);
+        }
+        r.top = (r.top + scale(self.hwnd, STRIP)).min(r.bottom);
+        unsafe {
             let _ = tab.controller.SetBounds(r);
+        }
+    }
+
+    fn redraw_strip(&self) {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut r);
+            r.bottom = scale(self.hwnd, STRIP);
+            let _ = InvalidateRect(Some(self.hwnd), Some(&r), false);
+        }
+    }
+
+    /// The tab rectangles of the strip, left to right, with each tab's id.
+    fn strip_layout(&self) -> Vec<(u32, RECT)> {
+        let mut client = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut client);
+        }
+        let ids: Vec<u32> = self.tabs.borrow().iter().map(|t| t.id).collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let s = |v| scale(self.hwnd, v);
+        let (pad, gap) = (s(8), s(6));
+        let avail = (client.right - pad * 2).max(1);
+        let w = s(TAB_WIDTH).min(avail / ids.len() as i32);
+        ids.iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let left = pad + w * i as i32;
+                (id, RECT { left, top: s(6), right: left + w - gap, bottom: s(STRIP) - s(6) })
+            })
+            .collect()
+    }
+
+    /// Draws the tab strip: one rounded tab per page, named after the agent that owns it in the
+    /// agent's color, with a spinner and "working" while a command runs in it. Painted off screen
+    /// first so it does not flicker.
+    fn paint_strip(&self, hdc: HDC) {
+        let hwnd = self.hwnd;
+        let s = |v| scale(hwnd, v);
+        let mut client = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut client);
+        }
+        let (w, h) = (client.right.max(1), s(STRIP));
+        let current = self.current.get();
+        let busy = self.busy.get();
+        unsafe {
+            let mem = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old_bmp = SelectObject(mem, bmp.into());
+            let brush = CreateSolidBrush(rgb3(STRIP_BG));
+            FillRect(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, brush);
+            let _ = DeleteObject(brush.into());
+            let font = |size: i32, weight: i32| {
+                CreateFontW(-s(size), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, (DEFAULT_PITCH.0 | FF_SWISS.0) as u32, w!("Segoe UI"))
+            };
+            let (bold, normal, small) = (font(13, 600), font(13, 400), font(12, 600));
+            let old_font = SelectObject(mem, bold.into());
+            SetBkMode(mem, TRANSPARENT);
+            let labels = self.labels.borrow();
+            let agents = self.agents.borrow();
+            let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+            for (id, r) in self.strip_layout() {
+                let selected = id == current;
+                let label = labels.get(&id).cloned().unwrap_or_default();
+                let color = match agents.iter().position(|a| *a == label) {
+                    Some(i) if !label.is_empty() => AGENT_COLORS[i % AGENT_COLORS.len()],
+                    _ => (148, 152, 163),
+                };
+                let (cx, cy) = ((r.left + s(16)) as f32, (r.top + r.bottom) as f32 / 2.0);
+                {
+                    let c = Canvas::new(mem);
+                    let (x, y) = (r.left as f32, r.top as f32);
+                    let (rw, rh) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+                    if selected {
+                        c.round_rect(x, y, rw, rh, s(8) as f32, argb(255, TAB_SELECTED), Some(argb(255, TAB_BORDER)));
+                    } else {
+                        c.round_rect(x, y, rw, rh, s(8) as f32, argb(255, TAB_BG), None);
+                    }
+                    if id == busy {
+                        let d = s(11) as f32;
+                        c.arc(cx, cy, d, s(2) as f32, 0.0, 360.0, argb(60, color));
+                        c.arc(cx, cy, d, s(2) as f32, (self.spin.get() * 36 % 360) as f32, 100.0, argb(255, color));
+                    } else {
+                        c.dot(cx, cy, s(8) as f32, argb(255, color));
+                    }
+                }
+
+                let mut text_rect = RECT { left: r.left + s(30), top: r.top, right: r.right - s(10), bottom: r.bottom };
+                if id == busy {
+                    // "working" at the right end while a command runs in this tab
+                    SelectObject(mem, small.into());
+                    SetTextColor(mem, rgb3(WORKING));
+                    let mut text: Vec<u16> = "working".encode_utf16().collect();
+                    let mut busy_rect = text_rect;
+                    DrawTextW(mem, &mut text, &mut busy_rect, flags | DT_RIGHT);
+                    let mut measure = text_rect;
+                    DrawTextW(mem, &mut text, &mut measure, flags | DT_CALCRECT);
+                    text_rect.right -= (measure.right - measure.left) + s(10);
+                }
+                if !label.is_empty() {
+                    SelectObject(mem, bold.into());
+                    SetTextColor(mem, rgb3(lighten(color, 0.25)));
+                    let mut text: Vec<u16> = label.encode_utf16().collect();
+                    let mut measure = text_rect;
+                    DrawTextW(mem, &mut text, &mut measure, flags | DT_CALCRECT);
+                    let width = (measure.right - measure.left).min((text_rect.right - text_rect.left) * 2 / 3);
+                    let mut label_rect = RECT { right: text_rect.left + width, ..text_rect };
+                    DrawTextW(mem, &mut text, &mut label_rect, flags);
+                    text_rect.left += width + s(8);
+                }
+                SelectObject(mem, normal.into());
+                SetTextColor(mem, if selected { rgb(226, 228, 233) } else { rgb(138, 142, 153) });
+                let (title, _) = self.tab_info(id);
+                let mut text: Vec<u16> = (if title.is_empty() { "New tab".to_string() } else { title }).encode_utf16().collect();
+                if text_rect.left < text_rect.right {
+                    DrawTextW(mem, &mut text, &mut text_rect, flags);
+                }
+            }
+            let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+            SelectObject(mem, old_font);
+            for f in [bold, normal, small] {
+                let _ = DeleteObject(f.into());
+            }
+            SelectObject(mem, old_bmp);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+        }
+    }
+
+    /// Turns the spinner; once the busy tab has been idle a moment, stops the timer.
+    fn tick(&self) {
+        self.spin.set(self.spin.get().wrapping_add(1));
+        if self.idle_at.get().is_some_and(|t| Instant::now() >= t) {
+            self.idle_at.set(None);
+            self.busy.set(0);
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), SPIN_TIMER);
+            }
+        }
+        self.redraw_strip();
+    }
+
+    /// A click on a tab in the strip shows that tab. Agents keep working in their own tabs.
+    fn click_strip(&self, x: i32, y: i32) {
+        if y >= scale(self.hwnd, STRIP) {
+            return;
+        }
+        let hit = self.strip_layout().into_iter().find(|(_, r)| x >= r.left && x < r.right).map(|(id, _)| id);
+        log(&format!("strip click at {x},{y}: tab {hit:?}"));
+        if let Some(id) = hit {
+            let _ = self.select_tab(id);
         }
     }
 }
@@ -138,6 +475,7 @@ impl Engine for Browser {
                 let _ = other.controller.SetIsVisible(false);
             }
         }
+        self.redraw_strip();
         Ok(())
     }
 
@@ -147,7 +485,35 @@ impl Engine for Browser {
             let Some(i) = tabs.iter().position(|t| t.id == id) else { return Ok(()) };
             tabs.remove(i)
         };
+        self.labels.borrow_mut().remove(&id);
+        self.redraw_strip();
         unsafe { tab.controller.Close() }.map_err(|e| e.to_string())
+    }
+
+    fn label_tab(&self, id: u32, label: &str) {
+        let changed = self.labels.borrow_mut().insert(id, label.to_string()).as_deref() != Some(label);
+        let mut agents = self.agents.borrow_mut();
+        if !agents.iter().any(|a| a == label) {
+            agents.push(label.to_string());
+        }
+        drop(agents);
+        if changed {
+            self.redraw_strip();
+        }
+    }
+
+    fn set_busy(&self, id: Option<u32>) {
+        match id {
+            Some(id) => {
+                self.busy.set(id);
+                self.idle_at.set(None);
+                unsafe {
+                    SetTimer(Some(self.hwnd), SPIN_TIMER, 50, None);
+                }
+            }
+            None => self.idle_at.set(Some(Instant::now() + Duration::from_millis(450))),
+        }
+        self.redraw_strip();
     }
 
     fn tab_info(&self, id: u32) -> (String, String) {
@@ -240,6 +606,31 @@ fn set_no_activate(hwnd: HWND, on: bool) {
 extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let normal = NORMAL.with(|n| n.get());
     match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            unsafe {
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if let Some(b) = current() {
+                    b.paint_strip(hdc);
+                }
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return LRESULT(0);
+        }
+        WM_ERASEBKGND => return LRESULT(1), // the strip and the pages cover the whole window
+        WM_TIMER if wparam.0 == SPIN_TIMER => {
+            if let Some(b) = current() {
+                b.tick();
+            }
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN => {
+            if let Some(b) = current() {
+                let (x, y) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
+                b.click_strip(x, y);
+            }
+            return LRESULT(0);
+        }
         // A real click by the user may activate the window; once it loses activation it goes quiet again.
         WM_MOUSEACTIVATE if !normal => {
             set_no_activate(hwnd, false);
@@ -346,6 +737,9 @@ pub fn create(normal: bool) -> std::result::Result<Rc<Browser>, String> {
             None, None, Some(instance), None)
             .map_err(|e| e.to_string())?
     };
+    start_gdiplus();
+    dark_title_bar(hwnd);
+    set_icons(hwnd);
     unsafe {
         let _ = ShowWindow(hwnd, if normal { SW_SHOW } else { SW_SHOWNOACTIVATE });
         let _ = UpdateWindow(hwnd);
@@ -370,6 +764,11 @@ pub fn create(normal: bool) -> std::result::Result<Rc<Browser>, String> {
         tabs: RefCell::new(Vec::new()),
         current: Cell::new(0),
         next_tab: Cell::new(1),
+        labels: RefCell::new(Default::default()),
+        busy: Cell::new(0),
+        idle_at: Cell::new(None),
+        spin: Cell::new(0),
+        agents: RefCell::new(Vec::new()),
     });
     BROWSER.with(|x| *x.borrow_mut() = Some(b.clone()));
     b.new_tab()?;
@@ -405,6 +804,8 @@ fn add_handlers(wv: &ICoreWebView2, s: &Arc<Shared>, hwnd: HWND, normal: bool) -
                 }
                 st.nav_finished(ok.as_bool());
                 log(&format!("nav completed ok={}", ok.as_bool()));
+                // the strip shows the new title
+                let _ = InvalidateRect(Some(HWND(hw as *mut _)), None, false);
                 Ok(())
             })),
             &mut token,

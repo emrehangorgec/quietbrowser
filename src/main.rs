@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
-quietbrowser: a browser for coding agents that never steals focus
+quietbrowser: one browser for all your coding agents, and it never steals focus
 
 Usage: quietbrowser [--session <name>] <command> [args]
 

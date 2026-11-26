@@ -192,6 +192,7 @@ fn handle(msg: &Value) -> Option<Value> {
         "initialize" => {
             let asked = msg["params"]["protocolVersion"].as_str().unwrap_or("");
             let version = if VERSIONS.contains(&asked) { asked } else { VERSIONS[VERSIONS.len() - 1] };
+            name_session(msg["params"]["clientInfo"]["name"].as_str());
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
@@ -204,6 +205,7 @@ fn handle(msg: &Value) -> Option<Value> {
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
             let args = msg["params"].get("arguments").cloned().unwrap_or(json!({}));
+            name_session(None);
             crate::log(&format!("mcp {name}"));
             match call_tool(name, &args) {
                 Ok(content) => json!({ "content": content }),
@@ -218,10 +220,20 @@ fn handle(msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-pub fn serve() -> i32 {
-    if std::env::var("QUIETBROWSER_SESSION").is_err() {
-        crate::set_session(format!("mcp-{}", std::process::id()));
+/// Names this agent's session after the client and its process, like "claude-code 4312", which
+/// is also what the tab strip shows. Only the first call counts.
+fn name_session(client: Option<&str>) {
+    if std::env::var("QUIETBROWSER_SESSION").is_ok_and(|s| !s.trim().is_empty()) {
+        return;
     }
+    let client = client
+        .map(|c| c.trim().trim_end_matches("-mcp-client").trim_end_matches("-client"))
+        .filter(|c| !c.is_empty())
+        .unwrap_or("agent");
+    crate::set_session(format!("{} {}", client.chars().take(24).collect::<String>(), std::process::id()));
+}
+
+pub fn serve() -> i32 {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -244,6 +256,7 @@ pub fn serve() -> i32 {
         }
     }
     // The agent is gone: close its tabs (and the browser, if no other agent uses it).
+    name_session(None);
     let _ = crate::call("quit", &[]);
     0
 }

@@ -151,6 +151,8 @@ pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<
         sess.current = *sess.tabs.last().unwrap();
     }
     b.select_tab(sess.current)?;
+    b.label_tab(sess.current, &display_name(session));
+    b.set_busy(Some(sess.current));
 
     let result = match cmd {
         "tabs" => Ok(list_tabs(b, sess)),
@@ -162,12 +164,22 @@ pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<
         }
         _ => run(b, cmd, args),
     };
+    for &t in &sess.tabs {
+        b.label_tab(t, &display_name(session));
+    }
+    b.set_busy(None);
     if result.is_ok() && cmd != "__has_text" && cmd != "record" {
         if let Some(frames) = sess.frames.as_mut() {
             capture(b, frames);
         }
     }
     result
+}
+
+/// How a session is named in the tab strip: MCP sessions are named after the agent and its process.
+fn display_name(session: &str) -> String {
+    let name: String = session.chars().take(32).collect();
+    if name == crate::server::DEFAULT_SESSION { "cli".into() } else { name }
 }
 
 /// After closing the selected tab, selects another one, so the window does not stay empty.

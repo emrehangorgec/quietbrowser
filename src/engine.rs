@@ -246,6 +246,10 @@ pub trait Engine {
     fn tab_info(&self, id: u32) -> (String, String);
     /// Asks for the user's attention without taking focus, if the engine can.
     fn attention(&self) {}
+    /// Names the agent (session) a tab belongs to, for engines that show their tabs.
+    fn label_tab(&self, _id: u32, _label: &str) {}
+    /// The tab a command is running in, or None once it is done, for engines that show it.
+    fn set_busy(&self, _id: Option<u32>) {}
 
     fn sleep(&self, ms: u64) -> R<()> {
         self.pump(Duration::from_millis(ms), &mut || false).map(|_| ())
