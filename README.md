@@ -3,23 +3,31 @@
 **One browser for all your coding agents.** See what each agent is doing, and take over when you need to. Available on Windows, macOS and Linux.
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Screen recording: three agents drive one quietbrowser window at the same time, each in a tab named after it. One fills a sign up form, one switches a pricing page to yearly, one finds a failing request on a docs page. Meanwhile text is typed into a focused editor, and the focus line stays on the editor with 0 focus steals." width="900">
+  <img src="docs/dashboard-demo.gif" alt="The quietbrowser dashboard shows Claude Code and Codex tabs. The user switches between their pages, takes control of the settings tab, saves a new workspace name, and returns control." width="1000">
 </p>
 
 Run Claude Code, Codex and other agents side by side. Each agent gets its own tabs in the same browser, and they share its login state.
 
 ## Watch and take control
 
-Run `quietbrowser ui` (or `npx -y quietbrowser ui`) to open the dashboard in your desktop browser. It runs on localhost on Windows, macOS and Linux. Open a page from an agent or try:
+The demo shows the local dashboard switching between two sessions, then taking control of one tab to edit a form and hand it back. The dashboard runs on localhost on Windows, macOS and Linux.
+
+Build from this branch to try the dashboard. From the repo root, run:
 
 ```sh
-quietbrowser --session frontend open localhost:3000
-quietbrowser --session docs open https://example.com
+cargo run --release -- ui
+```
+
+Open a page with your agent, or run these commands from another terminal in the repo:
+
+```sh
+cargo run --release -- --session frontend open https://example.com
+cargo run --release -- --session docs open https://www.iana.org/help/example-domains
 ```
 
 Select a tab to see the agent, its latest action and a live preview. **Take control** to click, type, paste or scroll in the preview, then choose **Return control**. Agent commands for that tab are blocked until you return it. Other tabs keep working. Sign-in requests appear as **Waiting for you** and use the same controls.
 
-Use `quietbrowser ui --no-open` to print the address without opening your browser. The dashboard stays on your machine and shares the existing quietbrowser profile.
+Pass `ui --no-open` to print the address without opening your browser. The dashboard stays on your machine and shares the existing quietbrowser profile.
 
 ## Several agents, one browser
 
@@ -35,6 +43,8 @@ quietbrowser --session docs open localhost:8000
 ## Never steals focus
 
 On Windows, quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agents drive it from the command line or over MCP while you keep typing. Click the window when you want to use it yourself.
+
+[Watch the Windows focus demo](docs/demo.gif) to see three sessions working while the editor keeps the keyboard focus.
 
 On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Sessions work the same way. Use the dashboard to watch or sign in while the agent browser stays headless. Set `QUIETBROWSER_HEADED=1` if you want to run the agent browser with its own visible window; Chrome then comes to the front when it starts.
 
@@ -131,7 +141,7 @@ claude mcp add quietbrowser -- npx -y quietbrowser mcp
 codex mcp add quietbrowser -- npx -y quietbrowser mcp
 ```
 
-The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_tabs`, `browser_console_messages`, ...), so agents already know how to use them. Two are extra: `browser_record` and `browser_login`. Then ask your agent to open a page and run `quietbrowser ui` to follow along.
+The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_tabs`, `browser_console_messages`, ...), so agents already know how to use them. Two are extra: `browser_record` and `browser_login`. To use the dashboard with your agent while testing this branch, point its MCP setup at the executable built in `target/release`.
 
 The package runs on Windows (x64), macOS (Intel and Apple Silicon) and Linux (x64). On macOS and Linux it needs Chrome, Edge, Brave or Chromium installed.
 
