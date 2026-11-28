@@ -96,6 +96,7 @@ static class Program
         // opening each page in a new tab the way automation tools open a new page.
         bool edge = exe == "edge";
         var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        http.DefaultRequestHeaders.Add("X-QuietBrowser-Client", "1");
         if (edge)
         {
             var profile = Path.Combine(Path.GetTempPath(), "qb-focustest-edge");

@@ -10,6 +10,7 @@ mod chrome;
 mod engine;
 mod mcp;
 mod server;
+mod ui;
 mod ws;
 
 use std::io::{Read, Write};
@@ -48,7 +49,8 @@ Usage: quietbrowser [--session <name>] <command> [args]
   record start | record stop [file.png]
                          Record every command as a frame of an animated PNG
   media dark|light|reset Emulate the page's color scheme
-  login <url>            Open a page for the user to log in by hand
+  ui [--no-open]         Open the local view for your agents’ tabs
+  login <url>            Ask the user to log in on the current agent’s tab
   start | quit           Start the browser, or close this session's tabs
                          (the browser closes with the last session; quit --all closes it now)
   install-skill          Install the agent skill for Claude Code (~/.claude/skills/quietbrowser)
@@ -300,8 +302,8 @@ fn request(method: &str, path: &str, body: &str, timeout: Duration) -> std::io::
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     s.set_read_timeout(Some(timeout))?;
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-QuietBrowser-Client: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        port(), body.len()
     );
     s.write_all(req.as_bytes())?;
     let mut raw = Vec::new();
@@ -404,10 +406,10 @@ pub fn call(cmd: &str, args: &[String]) -> Result<String, String> {
         "quit" => {
             if running() {
                 if args.first().is_some_and(|a| a == "--all") {
-                    let _ = request("GET", "/quit", "", Duration::from_secs(20));
+                    let (code, text) = request("GET", "/quit", "", Duration::from_secs(20)).map_err(|e| e.to_string())?;
+                    if code != 200 { return Err(text); }
                 } else {
-                    let body = serde_json::json!({ "cmd": "quit", "args": [], "session": session() }).to_string();
-                    let _ = request("POST", "/run", &body, Duration::from_secs(20));
+                    return send_command(cmd, args);
                 }
             }
             return Ok("closed".into());
@@ -420,6 +422,16 @@ pub fn call(cmd: &str, args: &[String]) -> Result<String, String> {
     if cmd == "start" {
         return Ok("running".into());
     }
+    send_command(cmd, args)
+}
+
+pub fn disconnect() {
+    if running() {
+        let _ = send_command("__detach", &[]);
+    }
+}
+
+fn send_command(cmd: &str, args: &[String]) -> Result<String, String> {
     let body = serde_json::json!({ "cmd": cmd, "args": args, "session": session() }).to_string();
     let (code, text) = request("POST", "/run", &body, Duration::from_secs(120)).map_err(|e| e.to_string())?;
     if code != 200 {
@@ -465,34 +477,53 @@ pub fn wait(args: &[String]) -> Result<String, String> {
     }
 }
 
-/// `login <url>`: shows the page to the user so they can log in by hand. The profile keeps the login.
-/// Headless Chrome has no window, so it is restarted with one until the user closes it.
+/// Request a login on this session's tab without restarting the shared browser.
 fn login(args: &[String]) -> Result<String, String> {
     let url = args.first().ok_or("login: missing url")?;
-    let chrome = use_chrome(&[]);
-    if chrome && server_id().as_deref() != Some("chrome-headed") {
-        if running() {
-            let _ = request("GET", "/quit", "", Duration::from_secs(20));
-        }
-        // inherited by the server started next
-        unsafe { std::env::set_var("QUIETBROWSER_HEADED", "1") };
-    }
-    let page = call("open", std::slice::from_ref(url))?;
-    let _ = call("__attention", &[]);
+    let page = call("__login", std::slice::from_ref(url))?;
     let head: Vec<&str> = page.lines().take(2).collect();
-    let note = if chrome {
-        "A browser window is open on this page (it may be behind other windows). Ask the user to log \
-         in there and close the window when they are done. quietbrowser then runs without a window \
-         again, and keeps the login."
-    } else {
-        "The quietbrowser window shows this page behind the user's other windows, and its taskbar \
-         button is flashing. Ask the user to click it, log in, and tell you when they are done. The \
-         login is kept for later runs."
-    };
-    Ok(format!("{}\n{note}", head.join("\n")))
+    Ok(format!(
+        "{}\nAsk the user to open {}, select this agent's tab, and click Take control. Once they have logged in and returned control, continue with a new snapshot.",
+        head.join("\n"), ui_url()
+    ))
+}
+
+fn ui_url() -> String {
+    format!("http://127.0.0.1:{}/ui/", port())
+}
+
+fn open_ui(args: &[String]) -> Result<i32, String> {
+    if !args.is_empty() && args != ["--no-open"] {
+        return Err("usage: quietbrowser ui [--no-open]".into());
+    }
+    ensure_running()?;
+    let (code, _) = request("GET", "/ui/", "", Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    if code != 200 {
+        return Err("The running browser does not support the dashboard. Close it and run quietbrowser ui again.".into());
+    }
+    let url = ui_url();
+    println!("{url}");
+    if args.is_empty() {
+        #[cfg(windows)]
+        let opener = "explorer.exe";
+        #[cfg(target_os = "macos")]
+        let opener = "open";
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let opener = "xdg-open";
+        let _ = std::process::Command::new(opener)
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    Ok(0)
 }
 
 fn client(cmd: &str, args: &[String]) -> Result<i32, String> {
+    if cmd == "ui" {
+        return open_ui(args);
+    }
     if cmd == "install-skill" {
         return install_skill().map(|_| 0);
     }

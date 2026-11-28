@@ -231,6 +231,8 @@ pub trait Engine {
     fn shared(&self) -> Arc<Shared>;
     /// One DevTools Protocol call on the selected tab. Fails after `timeout`.
     fn cdp_call(&self, method: &str, params: &Value, timeout: Duration) -> R<Value>;
+    /// Calls DevTools on a specific tab without changing the selected tab.
+    fn cdp_call_for(&self, id: u32, method: &str, params: &Value, timeout: Duration) -> R<Value>;
     /// Waits until `done` returns true or the timeout passes, keeping the engine responsive.
     fn pump(&self, timeout: Duration, done: &mut dyn FnMut() -> bool) -> R<bool>;
     fn go(&self, nav: &Nav) -> R<()>;

@@ -1,17 +1,23 @@
 """End to end smoke test: drives the quietbrowser CLI against local files.
 
-Usage: python test/smoke.py path/to/quietbrowser [--engine chrome|webview2]
-Uses port 9577 so it does not touch a browser you already have open.
+Usage: python test/smoke.py path/to/quietbrowser [--engine chrome|webview2] [--http]
+Uses port 9577 (override with QUIETBROWSER_TEST_PORT), separate from the default browser.
+Use --http if the test browser is configured to block file URLs.
 After every command it checks that the browser did not take focus: on macOS the front app must
 not be a browser, on Windows the foreground window must not belong to quietbrowser or Chrome.
 """
 
+import functools
+import http.server
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 
 PAGE = """<!doctype html><title>Smoke home</title>
 <h1>Smoke test</h1>
@@ -68,17 +74,25 @@ BROWSER_PROGRAMS = ("quietbrowser.exe", "msedgewebview2.exe", "chrome.exe", "mse
 
 def main():
     exe = os.path.abspath(sys.argv[1])
-    env = dict(os.environ, QUIETBROWSER_PORT="9577")
+    env = dict(os.environ, QUIETBROWSER_PORT=os.environ.get("QUIETBROWSER_TEST_PORT", "9577"))
     env.pop("QUIETBROWSER_SESSION", None)
     if "--engine" in sys.argv:
         env["QUIETBROWSER_ENGINE"] = sys.argv[sys.argv.index("--engine") + 1]
 
-    # plain files, so the test runs no server of its own
+    # File URLs avoid macOS local network prompts. Use HTTP when file URLs are blocked.
     site = pathlib.Path(tempfile.mkdtemp(prefix="quietbrowser-smoke-"))
     (site / "index.html").write_text(PAGE, encoding="utf-8")
     (site / "two.html").write_text(TWO, encoding="utf-8")
-    base = (site / "index.html").as_uri()
-    two = (site / "two.html").as_uri()
+    fixture = None
+    if "--http" in sys.argv:
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=site)
+        fixture = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=fixture.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{fixture.server_port}/index.html"
+        two = f"http://127.0.0.1:{fixture.server_port}/two.html"
+    else:
+        base = (site / "index.html").as_uri()
+        two = (site / "two.html").as_uri()
 
     failures = 0
 
@@ -108,6 +122,22 @@ def main():
         if not ok:
             failures += 1
             print("     " + detail)
+
+    def ui_request(path, data=None, headers=None):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{env['QUIETBROWSER_PORT']}/ui/{path}",
+            data=json.dumps(data).encode() if data is not None else None,
+            headers={"X-QuietBrowser-UI": "1"} if headers is None else headers,
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+
+    def ui_status(path, data=None, headers=None):
+        try:
+            ui_request(path, data, headers)
+            return 200
+        except urllib.error.HTTPError as error:
+            return error.code
 
     if sys.platform == "darwin":
         print("front app before:", front_app())
@@ -159,6 +189,45 @@ def main():
         run("--session", "other", "open", two, expect="Second page")
         run("eval", "document.title", expect='"Smoke home"')
         run("--session", "other", "eval", "document.title", expect='"Smoke two"')
+        run("ui", "--no-open", expect="/ui/")
+        check("dashboard loads locally", b"<title>quietbrowser</title>" in ui_request("", headers={}))
+        check("dashboard data requires its request header", ui_status("state", headers={}) == 403)
+        check("dashboard rejects foreign origins", ui_status("state", headers={
+            "X-QuietBrowser-UI": "1", "Origin": "https://example.com"
+        }) == 403)
+        state = json.loads(ui_request("state"))
+        listed = {tab["agent"]: tab for tab in state["tabs"]}
+        check("dashboard shows both sessions", set(listed) == {"cli", "other"}, str(listed))
+        current = listed["cli"]["id"]
+
+        def action(name, **fields):
+            return json.loads(ui_request("action", dict(instance=state["instance"], tab=current, action=name, **fields)))
+
+        position = "(r => [r.left + r.width / 2, r.top + r.height / 2])(document.querySelector('#name').getBoundingClientRect()).map((v, i) => v / [innerWidth, innerHeight][i])"
+        # The built-in eval output is JSON, so the click works at different viewport sizes.
+        point = json.loads(run("eval", position))
+        check("dashboard captures a preview", action("preview")["image"].startswith("/9j/"))
+        check("dashboard input requires takeover", ui_status("action", dict(
+            instance=state["instance"], tab=current, action="text", text="should not be sent"
+        )) == 409)
+        action("take")
+        run("eval", "document.title", expect="reserved for the user", code=1)
+        run("tab", "close", "0", expect="reserved for the user", code=1)
+        run("--session", "other", "eval", "document.title", expect='"Smoke two"')
+        action("click", x=point[0], y=point[1])
+        action("key", key="a")
+        action("text", text="typed by the user")
+        action("return")
+        run("eval", "document.querySelector('#name').value", expect='"typed by the user"')
+
+        run("login", base, expect="Take control")
+        waiting = json.loads(ui_request("state"))["tabs"]
+        check("sign-in is waiting on the same tab", any(
+            tab["id"] == current and tab["status"] == "waiting" for tab in waiting
+        ), str(waiting))
+        run("--session", "other", "eval", "document.title", expect='"Smoke two"')
+        action("take")
+        action("return")
         run("--session", "other", "quit")
         run("eval", "document.title", expect='"Smoke home"')
 
@@ -185,7 +254,10 @@ def main():
         # the MCP server closed its (unused) session on exit; this session must still be there
         run("eval", "document.title", expect='"Smoke home"')
     finally:
-        run("quit")
+        run("quit", "--all")
+        if fixture:
+            fixture.shutdown()
+            fixture.server_close()
 
     print("passed" if failures == 0 else f"{failures} failed")
     sys.exit(1 if failures else 0)

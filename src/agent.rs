@@ -87,6 +87,132 @@ struct Session {
     current: u32,
     /// Screenshots taken while recording.
     frames: Option<Vec<Vec<u8>>>,
+    views: HashMap<u32, TabView>,
+    detached: bool,
+}
+
+#[derive(Default)]
+struct TabView {
+    title: String,
+    url: String,
+    last: &'static str,
+    failed: bool,
+    human: bool,
+    waiting: bool,
+}
+
+impl TabView {
+    fn reserved(&self) -> bool {
+        self.human || self.waiting
+    }
+}
+
+fn publish_tabs(sessions: &HashMap<String, Session>, busy: Option<(u32, &str)>) {
+    let mut tabs = Vec::new();
+    for (name, session) in sessions {
+        for &id in &session.tabs {
+            let view = session.views.get(&id);
+            let active = busy.filter(|(tab, _)| *tab == id).map(|(_, action)| action);
+            let last = view.map(|v| v.last).filter(|label| !label.is_empty());
+            let status = match view {
+                Some(v) if v.human => "controlled",
+                Some(v) if v.waiting => "waiting",
+                _ if active.is_some() => "working",
+                _ => "ready",
+            };
+            tabs.push((id, json!({
+                "id": id, "agent": display_name(name), "title": view.map(|v| &v.title),
+                "detached": session.detached,
+                "url": view.map(|v| &v.url), "status": status, "action": active.or(last),
+                "failed": active.is_none() && view.is_some_and(|v| v.failed),
+            })));
+        }
+    }
+    tabs.sort_unstable_by_key(|(id, _)| *id);
+    crate::ui::publish(tabs.into_iter().map(|(_, tab)| tab).collect());
+}
+
+fn update_view(b: &dyn Engine, id: u32, view: &mut TabView) {
+    let (title, url) = b.tab_info(id);
+    view.title = title;
+    view.url = if url.starts_with("data:") { "data:".into() } else {
+        url.split(['?', '#']).next().unwrap_or("").chars().take(300).collect()
+    };
+}
+
+fn action_name(cmd: &str, args: &[String]) -> &'static str {
+    match cmd {
+        "open" => "Open page",
+        "__login" => "Request sign-in",
+        "tab" if args.first().is_some_and(|s| s == "new") => "Open tab",
+        "tab" => "Manage tabs",
+        "tabs" => "List tabs",
+        "snapshot" | "__changes" | "__has_text" | "text" => "Read page",
+        "click" | "hover" => "Interact with page",
+        "fill" | "type" | "press" | "select" => "Enter input",
+        "reload" => "Reload page",
+        "back" => "Go back",
+        "eval" => "Evaluate script",
+        "console" => "Read console",
+        "network" => "Read network activity",
+        "record" | "screenshot" => "Capture page",
+        _ => "Inspect tab",
+    }
+}
+
+const HUMAN_CONTROL: &str = "This tab is reserved for the user. Ask them to return control in quietbrowser ui, then take a fresh snapshot.";
+
+fn dashboard(b: &dyn Engine, sessions: &mut HashMap<String, Session>, args: &[String]) -> R<String> {
+    let request: Value = serde_json::from_str(args.first().ok_or("Missing action.")?).map_err(|_| "Invalid action.")?;
+    if !crate::ui::is_current(&request) {
+        return Err("The browser restarted. Select a tab again.".into());
+    }
+    let id = request["tab"].as_u64().and_then(|id| u32::try_from(id).ok()).ok_or("Missing tab.")?;
+    let owner = sessions.iter().find(|(_, s)| s.tabs.contains(&id))
+        .map(|(name, _)| name.clone()).ok_or("The tab was closed.")?;
+    let session = sessions.get_mut(&owner).unwrap();
+    let action = request["action"].as_str().ok_or("Missing action.")?;
+    let view = session.views.entry(id).or_default();
+    let result = match action {
+        "preview" => {
+            update_view(b, id, view);
+            crate::ui::preview(b, id)?
+        }
+        "take" => {
+            view.human = true;
+            json!({})
+        }
+        "return" => {
+            if session.detached {
+                b.close_tab(id)?;
+                session.tabs.retain(|tab| *tab != id);
+                session.views.remove(&id);
+                if session.tabs.is_empty() {
+                    sessions.remove(&owner);
+                }
+                if sessions.values().all(|s| s.tabs.is_empty()) {
+                    exit_requested();
+                } else {
+                    show_any(b);
+                }
+            } else {
+                view.human = false;
+                view.waiting = false;
+                update_view(b, id, view);
+            }
+            json!({})
+        }
+        "click" | "scroll" | "text" | "key" => {
+            if !view.human {
+                return Err("Take control before interacting with the tab.".into());
+            }
+            crate::ui::input(b, id, action, &request)?;
+            json!({})
+        }
+        _ => return Err("Unknown action.".into()),
+    };
+    publish_tabs(sessions, None);
+    Ok(result.to_string())
 }
 
 static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Default::default);
@@ -108,12 +234,35 @@ pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<
     let mut sessions = SESSIONS.lock().unwrap();
     for s in sessions.values_mut() {
         s.tabs.retain(|t| live.contains(t));
+        s.views.retain(|t, _| s.tabs.contains(t));
+    }
+    if cmd == crate::server::UI {
+        publish_tabs(&sessions, None);
+        return dashboard(b, &mut sessions, args);
     }
     let others = |sessions: &HashMap<String, Session>| -> usize {
         sessions.iter().filter(|(name, _)| name.as_str() != session).map(|(_, s)| s.tabs.len()).sum()
     };
 
-    if cmd == "quit" {
+    if matches!(cmd, "quit" | "__detach") {
+        if let Some(s) = sessions.get_mut(session).filter(|s| s.views.values().any(TabView::reserved)) {
+            if cmd == "quit" {
+                return Err(HUMAN_CONTROL.into());
+            }
+            s.detached = true;
+            s.tabs.retain(|id| {
+                if s.views.get(id).is_some_and(TabView::reserved) {
+                    true
+                } else {
+                    let _ = b.close_tab(*id);
+                    false
+                }
+            });
+            s.views.retain(|id, _| s.tabs.contains(id));
+            show_any(b);
+            publish_tabs(&sessions, None);
+            return Ok("closed".into());
+        }
         // The last session to leave closes the browser.
         if others(&sessions) == 0 {
             exit_requested();
@@ -125,6 +274,7 @@ pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<
             }
         }
         show_any(b);
+        publish_tabs(&sessions, None);
         return Ok("closed".into());
     }
 
@@ -147,32 +297,53 @@ pub fn dispatch(b: &dyn Engine, session: &str, cmd: &str, args: &[String]) -> R<
     }
     let others_have_tabs = others(&sessions) > 0;
     let sess = sessions.get_mut(session).unwrap();
+    sess.detached = false;
     if !sess.tabs.contains(&sess.current) {
         sess.current = *sess.tabs.last().unwrap();
     }
-    b.select_tab(sess.current)?;
-    b.label_tab(sess.current, &display_name(session));
-    b.set_busy(Some(sess.current));
+    let id = sess.current;
+    let management = matches!(cmd, "tab" | "tabs");
+    if !management && sess.views.get(&id).is_some_and(TabView::reserved) {
+        return Err(HUMAN_CONTROL.into());
+    }
+    let action = action_name(cmd, args);
+    b.select_tab(id)?;
+    b.label_tab(id, &display_name(session));
+    b.set_busy(Some(id));
+    publish_tabs(&sessions, Some((id, action)));
 
+    let sess = sessions.get_mut(session).unwrap();
     let result = match cmd {
         "tabs" => Ok(list_tabs(b, sess)),
         "tab" => tab(b, sess, args, others_have_tabs),
         "record" => record(b, sess, args),
-        "__attention" => {
+        "__login" => run(b, "open", args).inspect(|_| {
+            sess.views.entry(id).or_default().waiting = true;
             b.attention();
-            Ok("ok".into())
-        }
+        }),
         _ => run(b, cmd, args),
     };
     for &t in &sess.tabs {
         b.label_tab(t, &display_name(session));
     }
     b.set_busy(None);
-    if result.is_ok() && cmd != "__has_text" && cmd != "record" {
-        if let Some(frames) = sess.frames.as_mut() {
-            capture(b, frames);
-        }
+    if result.is_ok() && !matches!(cmd, "__has_text" | "record" | "__login")
+        && !sess.tabs.is_empty() && !sess.views.get(&sess.current).is_some_and(TabView::reserved)
+        && let Some(frames) = sess.frames.as_mut()
+    {
+        capture(b, frames);
     }
+    sess.views.retain(|t, _| sess.tabs.contains(t));
+    if sess.tabs.contains(&sess.current) {
+        let current = sess.current;
+        let view = sess.views.entry(current).or_default();
+        if cmd != "__has_text" {
+            view.last = action;
+            view.failed = result.is_err();
+        }
+        update_view(b, current, view);
+    }
+    publish_tabs(&sessions, None);
     result
 }
 
@@ -195,8 +366,11 @@ fn list_tabs(b: &dyn Engine, sess: &Session) -> String {
         .iter()
         .enumerate()
         .map(|(i, &id)| {
-            let (title, url) = b.tab_info(id);
             let mark = if id == sess.current { "(current) " } else { "" };
+            if sess.views.get(&id).is_some_and(TabView::reserved) {
+                return format!("- {i}: {mark}Reserved for the user");
+            }
+            let (title, url) = b.tab_info(id);
             format!("- {i}: {mark}[{title}]({url})")
         })
         .collect();
@@ -224,6 +398,9 @@ fn tab(b: &dyn Engine, sess: &mut Session, args: &[String], others_have_tabs: bo
         }
         "close" => {
             let id = index(args.get(1))?;
+            if sess.views.get(&id).is_some_and(TabView::reserved) {
+                return Err(HUMAN_CONTROL.into());
+            }
             sess.tabs.retain(|&t| t != id);
             if sess.tabs.is_empty() && !others_have_tabs {
                 exit_requested();
@@ -256,6 +433,9 @@ fn tab(b: &dyn Engine, sess: &mut Session, args: &[String], others_have_tabs: bo
 fn select_and_show(b: &dyn Engine, sess: &mut Session, id: u32) -> R<String> {
     b.select_tab(id)?;
     sess.current = id;
+    if sess.views.get(&id).is_some_and(TabView::reserved) {
+        return Ok(format!("{}\n{HUMAN_CONTROL}", list_tabs(b, sess)));
+    }
     let snap = snapshot(b)?;
     *b.shared().last_snapshot.lock().unwrap() = Some(snap.clone());
     Ok(format!("{}\n{}\n{snap}", list_tabs(b, sess), header(b)))

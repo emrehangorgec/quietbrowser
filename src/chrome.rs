@@ -421,6 +421,11 @@ impl Engine for Chrome {
         self.call_on(&tab, method, params, timeout)
     }
 
+    fn cdp_call_for(&self, id: u32, method: &str, params: &Value, timeout: Duration) -> R<Value> {
+        let tab = self.tabs.lock().unwrap().iter().find(|t| t.id == id).cloned().ok_or("the tab was closed")?;
+        self.call_on(&tab, method, params, timeout)
+    }
+
     fn pump(&self, timeout: Duration, done: &mut dyn FnMut() -> bool) -> R<bool> {
         let start = Instant::now();
         loop {

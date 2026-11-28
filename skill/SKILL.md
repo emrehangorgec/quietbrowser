@@ -32,7 +32,7 @@ quietbrowser screenshot [file.png]   save a screenshot of the page, prints the p
 quietbrowser record start            every command after this adds a frame
 quietbrowser record stop [file.png]  save them as an animated PNG (plays on GitHub)
 quietbrowser media dark|light|reset  emulate the page color scheme
-quietbrowser login <url>             show a page to the user to log in by hand
+quietbrowser login <url>             ask the user to sign in from the dashboard
 quietbrowser quit                    close your tabs when you are done
 ```
 
@@ -59,6 +59,6 @@ its own tabs.
 * Dialogs are accepted automatically. Check `dialogs` if a page seems stuck.
 * Downloads are blocked and popups open in the same tab.
 * If a page needs a login or a CAPTCHA, run `quietbrowser login <url>`, tell the user
-  what it printed, and wait until they say they are done. Never type passwords, card
+  what it printed, and wait until they return control. Take a fresh snapshot before continuing. Never type passwords, card
   numbers or other secrets. The profile is kept, so the login stays for later runs.
 * Do not try to bring the window to the front. Leaving focus with the user is the point.

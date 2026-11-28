@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>quietbrowser</title>
+  <link rel="stylesheet" href="/ui/app.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1><span class="mark" aria-hidden="true"></span>quietbrowser</h1>
+    <span id="connection" class="connection" role="status">Connecting…</span>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar" aria-label="Agent tabs">
+      <h2>Agent tabs <span id="tab-count">0</span></h2>
+      <div id="tabs"></div>
+    </aside>
+
+    <section class="content" aria-label="Page preview">
+      <div id="empty" class="empty">
+        <h2>Waiting for an agent</h2>
+        <p>Ask Claude Code or Codex to open a page with quietbrowser, or open a page from your terminal.</p>
+        <code>quietbrowser --session frontend open localhost:3000</code>
+      </div>
+
+      <div id="details" hidden>
+        <header class="tab-header">
+          <div class="tab-location">
+            <p id="agent"></p>
+            <h2 id="title">Untitled tab</h2>
+            <p id="url" class="url"></p>
+          </div>
+          <button id="control" type="button">Take control</button>
+        </header>
+        <div id="activity" class="activity"></div>
+        <p id="error" class="error" role="alert" hidden></p>
+        <div class="preview">
+          <p id="preview-message">Loading preview…</p>
+          <img id="page" alt="Current page preview" hidden draggable="false">
+        </div>
+        <p id="hint" class="hint">Live preview. Take control to click, type or scroll.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

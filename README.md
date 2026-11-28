@@ -1,12 +1,25 @@
 # quietbrowser
 
-**One browser for all your coding agents.** Each agent gets its own tabs, they share your logins, and none of them ever steals your focus.
+**One browser for all your coding agents.** See what each agent is doing, and take over when you need to. Available on Windows, macOS and Linux.
 
 <p align="center">
   <img src="docs/demo.gif" alt="Screen recording: three agents drive one quietbrowser window at the same time, each in a tab named after it. One fills a sign up form, one switches a pricing page to yearly, one finds a failing request on a docs page. Meanwhile text is typed into a focused editor, and the focus line stays on the editor with 0 focus steals." width="900">
 </p>
 
-Run Claude Code, Codex and a few more agents side by side, and each one opens a browser of its own: a stack of windows, logins that only exist in one of them, and every window jumping in front of you while you type. quietbrowser is one browser they all share. Each agent works in tabs of its own, so they never click around in each other's pages. Logins are shared, so you sign in once. And the window never takes your keyboard focus.
+Run Claude Code, Codex and other agents side by side. Each agent gets its own tabs in the same browser, and they share its login state.
+
+## Watch and take control
+
+Run `quietbrowser ui` (or `npx -y quietbrowser ui`) to open the dashboard in your desktop browser. It runs on localhost on Windows, macOS and Linux. Open a page from an agent or try:
+
+```sh
+quietbrowser --session frontend open localhost:3000
+quietbrowser --session docs open https://example.com
+```
+
+Select a tab to see the agent, its latest action and a live preview. **Take control** to click, type, paste or scroll in the preview, then choose **Return control**. Agent commands for that tab are blocked until you return it. Other tabs keep working. Sign-in requests appear as **Waiting for you** and use the same controls.
+
+Use `quietbrowser ui --no-open` to print the address without opening your browser. The dashboard stays on your machine and shares the existing quietbrowser profile.
 
 ## Several agents, one browser
 
@@ -23,7 +36,7 @@ quietbrowser --session docs open localhost:8000
 
 On Windows, quietbrowser is a real browser window (Microsoft Edge WebView2) that shows up without taking focus. The agents drive it from the command line or over MCP while you keep typing. Click the window when you want to use it yourself.
 
-On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Sessions work the same way. Set `QUIETBROWSER_HEADED=1` to see the window, for example to log in once; Chrome then comes to the front when it starts.
+On macOS and Linux it drives the Chrome, Edge, Brave or Chromium you already have. Chrome raises its own window whenever it opens one, so there it runs without a window by default and cannot take focus. Sessions work the same way. Use the dashboard to watch or sign in while the agent browser stays headless. Set `QUIETBROWSER_HEADED=1` if you want to run the agent browser with its own visible window; Chrome then comes to the front when it starts.
 
 Measured on Windows. A test window stays in front while the browser is started and driven in the background. It records every moment another window becomes the foreground window and counts typed keys that never arrive. The test pages try hard to grab focus: `autofocus`, `window.focus()` every 50 ms, `alert`/`confirm`/`prompt`, `window.open`.
 
@@ -82,7 +95,8 @@ quietbrowser dialogs                 dialogs answered so far
 quietbrowser screenshot [file.png]   save a screenshot, print the path
 quietbrowser record start | record stop [file.png]
 quietbrowser media dark|light|reset  emulate the color scheme
-quietbrowser login <url>             show a page to you, to log in by hand
+quietbrowser ui [--no-open]          open the local dashboard
+quietbrowser login <url>             reserve this tab for you to sign in
 quietbrowser start | quit [--all]
 quietbrowser install-skill           install the agent skill for Claude Code
 quietbrowser mcp                     run as an MCP server over stdio
@@ -117,7 +131,7 @@ claude mcp add quietbrowser -- npx -y quietbrowser mcp
 codex mcp add quietbrowser -- npx -y quietbrowser mcp
 ```
 
-The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_tabs`, `browser_console_messages`, ...), so agents already know how to use them. Two are extra: `browser_record` and `browser_login`. Then ask your agent to open a page. The window opens on the first command, behind whatever you are doing.
+The tools use the same names and arguments as Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_tabs`, `browser_console_messages`, ...), so agents already know how to use them. Two are extra: `browser_record` and `browser_login`. Then ask your agent to open a page and run `quietbrowser ui` to follow along.
 
 The package runs on Windows (x64), macOS (Intel and Apple Silicon) and Linux (x64). On macOS and Linux it needs Chrome, Edge, Brave or Chromium installed.
 
@@ -180,7 +194,7 @@ If the browser is not found, point `QUIETBROWSER_CHROME` at it. `python test/smo
 
 Early. The exe is not code signed yet, so a browser download may show a SmartScreen warning once. Not done yet: a DevTools endpoint for Playwright, and packages for winget and Scoop.
 
-Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile` on Windows, `~/Library/Application Support/quietbrowser` on macOS and `~/.local/share/quietbrowser` on Linux. If a site needs a login or a CAPTCHA, the agent runs `login <url>` and asks you to do it. On Windows the window shows the page and its taskbar button flashes, without taking focus. On macOS and Linux Chrome restarts with a window; log in, close the window, and it runs without one again.
+Logins are kept in `%LOCALAPPDATA%\quietbrowser\profile` on Windows, `~/Library/Application Support/quietbrowser` on macOS and `~/.local/share/quietbrowser` on Linux. If a site needs you to sign in, the agent runs `login <url>`. Open the dashboard, take control of the waiting tab, and return it when done. The browser and the other agents’ tabs keep running during sign-in.
 
 ## License
 

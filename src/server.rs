@@ -9,6 +9,7 @@ use std::time::Duration;
 /// The job that closes the browser, with the tabs of every session.
 pub const QUIT: &str = "__quit";
 pub const DEFAULT_SESSION: &str = "default";
+pub const UI: &str = "__ui";
 
 pub struct Job {
     /// Which agent sent it. Each session has its own tabs.
@@ -64,23 +65,85 @@ pub fn start(port: u16, id: String, wake: Box<dyn Fn() + Send + Sync>) -> std::i
 }
 
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let (path, query, body) = read_request(&mut stream)?;
-    let (code, text) = match dispatch(&path, &query, &body) {
-        Ok(t) => (200, t),
-        Err(e) => (500, e),
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let port = stream.local_addr()?.port();
+    let request = read_request(&mut stream)?;
+    let (code, mime, body) = if request.path.starts_with("/ui") {
+        serve_ui(&request, port)
+    } else if request.header("X-QuietBrowser-Client") != Some("1")
+        || request.header("Origin").is_some()
+        || request.header("Sec-Fetch-Site").is_some()
+    {
+        (403, "text/plain", "Quietbrowser client required".into())
+    } else {
+        match dispatch(&request.path, &request.query, &request.body) {
+            Ok(text) => (200, "text/plain", text),
+            Err(e) => (500, "text/plain", e),
+        }
     };
-    let reason = if code == 200 { "OK" } else { "Internal Server Error" };
+    let reason = match code {
+        200 => "OK", 403 => "Forbidden",
+        404 => "Not Found", 409 => "Conflict", _ => "Internal Server Error",
+    };
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        text.len()
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {mime}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; img-src data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n\r\n",
+        body.len()
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(text.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
     stream.flush()
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, Vec<(String, String)>, String)> {
+struct Request {
+    method: String,
+    path: String,
+    query: Vec<(String, String)>,
+    head: String,
+    body: String,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+}
+
+fn serve_ui(req: &Request, port: u16) -> (u16, &'static str, String) {
+    let host = format!("127.0.0.1:{port}");
+    let origin = format!("http://{host}");
+    if req.header("Host") != Some(host.as_str())
+        || req.header("Origin").is_some_and(|o| o != origin)
+    {
+        return (403, "text/plain", "Open the local address printed by quietbrowser ui".into());
+    }
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/ui" | "/ui/") => return (200, "text/html", crate::ui::HTML.into()),
+        ("GET", "/ui/app.js") => return (200, "text/javascript", crate::ui::JS.into()),
+        ("GET", "/ui/app.css") => return (200, "text/css", crate::ui::CSS.into()),
+        _ => {}
+    }
+    if req.header("X-QuietBrowser-UI") != Some("1")
+        || req.header("Sec-Fetch-Site").is_some_and(|s| !matches!(s, "same-origin" | "none"))
+    {
+        return (403, "text/plain", "Quietbrowser UI required".into());
+    }
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/ui/state") => (200, "application/json", crate::ui::state()),
+        ("POST", "/ui/action") => match run("", UI, vec![req.body.clone()]) {
+            Ok(text) => (200, "application/json", text),
+            Err(e) => (409, "text/plain", e),
+        },
+        _ => (404, "text/plain", "Unknown UI route".into()),
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
+    const MAX_HEADER: usize = 16 * 1024;
+    const MAX_BODY: usize = 1024 * 1024;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
@@ -90,39 +153,33 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, Vec<(String,
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i + 4;
+            if i <= MAX_HEADER { break i + 4; }
         }
-        if buf.len() > 1 << 20 {
+        if buf.len() > MAX_HEADER {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
     };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let length = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    while buf.len() < header_end + length {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut line = head.split_whitespace();
+    let method = line.next().unwrap_or("").to_string();
+    let target = line.next().unwrap_or("/");
+    let (path, q) = target.split_once('?').unwrap_or((target, ""));
+    let path = path.to_string();
+    let query = q.split('&').filter(|p| !p.is_empty()).map(|p| {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        (decode(k), decode(v))
+    }).collect();
+    let mut req = Request { method, path, query, head, body: String::new() };
+    let length: usize = req.header("Content-Length").unwrap_or("0").parse()
+        .map_err(|_| std::io::ErrorKind::InvalidData)?;
+    if length > MAX_BODY || req.header("Transfer-Encoding").is_some() {
+        return Err(std::io::ErrorKind::InvalidData.into());
     }
-    let body = String::from_utf8_lossy(&buf[header_end..buf.len().min(header_end + length)]).to_string();
-    let target = head.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("/").to_string();
-    let (path, q) = target.split_once('?').unwrap_or((&target, ""));
-    let query = q
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (decode(k), decode(v))
-        })
-        .collect();
-    Ok((path.to_string(), query, body))
+    let already_read = buf.len().min(header_end + length);
+    buf.resize(header_end + length, 0);
+    stream.read_exact(&mut buf[already_read..])?;
+    req.body = String::from_utf8(buf.split_off(header_end)).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    Ok(req)
 }
 
 fn decode(s: &str) -> String {
@@ -150,8 +207,7 @@ fn decode(s: &str) -> String {
 }
 
 fn run(session: &str, cmd: &str, args: Vec<String>) -> Result<String, String> {
-    let guard = QUEUE.lock().map_err(|_| "busy".to_string())?;
-    let tx = guard.as_ref().ok_or("not ready")?;
+    let tx = QUEUE.lock().map_err(|_| "busy".to_string())?.clone().ok_or("not ready")?;
     let (reply, rx) = mpsc::channel();
     tx.send(Job { session: session.to_string(), cmd: cmd.to_string(), args, reply }).map_err(|_| "the browser closed".to_string())?;
     if let Some(wake) = WAKE.get() {
@@ -166,6 +222,7 @@ fn dispatch(path: &str, q: &[(String, String)], body: &str) -> Result<String, St
         "/run" => {
             let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad request: {e}"))?;
             let cmd = v["cmd"].as_str().ok_or("bad request: cmd missing")?;
+            if cmd == UI { return Err("unknown command".into()); }
             let args = v["args"]
                 .as_array()
                 .map(|a| a.iter().map(|x| x.as_str().unwrap_or_default().to_string()).collect())

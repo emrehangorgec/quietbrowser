@@ -79,7 +79,7 @@ fn tools() -> Value {
                 "action": { "type": "string", "enum": ["start", "stop"], "description": "Start or stop recording" },
                 "filename": { "type": "string", "description": "File to save the PNG to on stop. A temp file if omitted." }
             }), &["action"]),
-        tool("browser_login", "Show a page to the user so they can log in or solve a CAPTCHA by hand. \
+        tool("browser_login", "Ask the user to take control of this tab in the quietbrowser dashboard and sign in by hand. \
             The browser keeps the login for later. Tell the user what to do and wait for them.",
             json!({ "url": { "type": "string", "description": "The login page" } }), &["url"]),
         tool("browser_close", "Close this agent's tabs. The browser closes with the last agent.", json!({}), &[]),
@@ -257,6 +257,6 @@ pub fn serve() -> i32 {
     }
     // The agent is gone: close its tabs (and the browser, if no other agent uses it).
     name_session(None);
-    let _ = crate::call("quit", &[]);
+    crate::disconnect();
     0
 }

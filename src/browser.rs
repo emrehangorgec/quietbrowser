@@ -393,7 +393,11 @@ impl Engine for Browser {
     }
 
     fn cdp_call(&self, method: &str, params: &serde_json::Value, timeout: Duration) -> std::result::Result<serde_json::Value, String> {
-        let wv = self.tab()?.wv;
+        self.cdp_call_for(self.current.get(), method, params, timeout)
+    }
+
+    fn cdp_call_for(&self, id: u32, method: &str, params: &serde_json::Value, timeout: Duration) -> std::result::Result<serde_json::Value, String> {
+        let wv = self.tabs.borrow().iter().find(|t| t.id == id).map(|t| t.wv.clone()).ok_or("the tab was closed")?;
         let (tx, rx) = mpsc::channel();
         let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, json| {
             let _ = tx.send(match hr {
