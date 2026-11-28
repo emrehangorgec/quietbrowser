@@ -264,7 +264,7 @@ page.addEventListener("keydown", (event) => {
     control.focus();
   } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
     event.preventDefault();
-    queueInput("key", { key: "a", meta: event.metaKey });
+    queueInput("key", { key: "selectAll" });
   } else if (!event.ctrlKey && !event.metaKey && !event.altKey) {
     if (keys.has(event.key)) {
       event.preventDefault();

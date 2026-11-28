@@ -215,7 +215,7 @@ def main():
         run("tab", "close", "0", expect="reserved for the user", code=1)
         run("--session", "other", "eval", "document.title", expect='"Smoke two"')
         action("click", x=point[0], y=point[1])
-        action("key", key="a")
+        action("key", key="selectAll")
         action("text", text="typed by the user")
         action("return")
         run("eval", "document.querySelector('#name').value", expect='"typed by the user"')

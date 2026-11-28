@@ -72,18 +72,26 @@ pub fn input(b: &dyn Engine, id: u32, action: &str, request: &Value) -> R<()> {
         }
         "key" => {
             let key = request["key"].as_str().ok_or("Missing key.")?;
+            let select_all = key == "selectAll";
+            let key = if select_all { "a" } else { key };
             let vk = match key {
                 "Backspace" => 8, "Tab" => 9, "Enter" => 13, "Escape" => 27,
                 "PageUp" => 33, "PageDown" => 34, "End" => 35, "Home" => 36,
                 "ArrowLeft" => 37, "ArrowUp" => 38, "ArrowRight" => 39, "ArrowDown" => 40,
-                "Delete" => 46, "a" => 65,
+                "Delete" => 46, "a" if select_all => 65,
                 _ => return Err("Unsupported key.".into()),
             };
-            let modifiers = if key == "a" { if request["meta"] == true { 4 } else { 2 } } else if request["shift"] == true { 8 } else { 0 };
+            let modifiers = if select_all {
+                if cfg!(target_os = "macos") { 4 } else { 2 }
+            } else if request["shift"] == true { 8 } else { 0 };
             let kind = if key == "Enter" { "keyDown" } else { "rawKeyDown" };
             let mut down = json!({ "type": kind, "key": key, "windowsVirtualKeyCode": vk, "modifiers": modifiers });
             if key == "Enter" {
                 down["text"] = json!("\r");
+            }
+            if select_all {
+                down["code"] = json!("KeyA");
+                down["commands"] = json!(["selectAll"]);
             }
             call(b, id, "Input.dispatchKeyEvent", down)?;
             call(b, id, "Input.dispatchKeyEvent", json!({
